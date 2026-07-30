@@ -1,19 +1,14 @@
 
 CC = gcc
 FLAGS = -I ./NtyCo/core/ -L ./NtyCo/ -lntyco
-SRCS = kvstore.c \
-		kvstore_mp.c \
-		ntyco_entry.c \
-		epoll_entry.c \
-		kvstore_array.c \
-		kvstore_rbtree.c \
-		kvstore_hash.c
+FLAGS += -Isrc -INtyCo/include     # -Isrc 让编译器去 src 找头文件
+SRCS = $(wildcard src/*.c)
 TESTCASE_SRCS = testcase.c
 TARGET = kvstore
 SUBDIR = ./NtyCo/
 TESTCASE = testcase
 
-OBJS = $(SRCS:.c=.o)
+OBJS = $(SRCS:src/%.c=%.o)
 
 all: $(SUBDIR) $(TARGET) $(TESTCASE)
 
@@ -29,7 +24,7 @@ $(TARGET): $(OBJS)
 $(TESTCASE): $(TESTCASE_SRCS)
 	$(CC) -o $@ $^
 
-%.o: %.c
+%.o: src/%.c
 	$(CC) $(FLAGS) -c $^ -o $@
 
 
