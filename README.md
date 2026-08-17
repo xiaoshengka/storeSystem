@@ -2,21 +2,24 @@
 
 基于 Linux C、非阻塞 Socket 与单线程 epoll Reactor 的内存 KV 服务。
 
-当前发布版本为 `v0.2.0`，默认网络后端已经从 NtyCo 原型切换为非阻塞 Socket、
-Level-Triggered epoll 与单线程 Reactor。NtyCo 仅作为历史/可选对照实现保留。
+当前发布版本为 `v0.2.0`。`feature/resp` 正在开发 v0.3.0：为 epoll 主线增加
+RESP2 增量解析、可靠的粘包/半包处理、Pipeline，以及统一的
+`SET/GET/DEL/PING` 命令。NtyCo 仅作为历史/可选对照实现保留。
 
 ## 架构
 
 ```text
 Client
-  -> epoll Reactor（默认网络后端）
-  -> 文本命令分发
-  -> Array / RBTree / Hash 内存引擎
+  -> epoll Reactor
+  -> RESP2 增量解析/编码
+  -> 统一命令服务
+  -> Hash 或 RBTree 内存引擎
 ```
 
-Reactor 负责监听、连接对象、每连接输入/输出缓冲、非阻塞收发、部分写和资源
-回收。网络层通过请求回调调用服务层，不直接访问具体 KV 引擎。详细设计见
-[`docs/reactor-v0.2.md`](docs/reactor-v0.2.md)。
+Reactor 负责连接、输入/输出缓冲、非阻塞收发、Pipeline 背压和资源回收；协议层
+只处理 RESP 字节帧，服务层负责命令语义，引擎层不依赖网络或协议。v0.2.0 Reactor
+设计见 [`docs/reactor-v0.2.md`](docs/reactor-v0.2.md)，v0.3.0 协议设计见
+[`docs/resp-v0.3.md`](docs/resp-v0.3.md)。
 
 ## 环境与构建
 
@@ -30,36 +33,54 @@ make
 
 默认构建生成：
 
-- `kvstore`：epoll Reactor 服务端，监听 `0.0.0.0:9096`。
-- `legacy_client`：保留的原型测试/压测客户端。
-- `qps_client`：使用多条持久连接执行请求/响应校验的 QPS 基准客户端。
+- `kvstore`：RESP2 epoll Reactor 服务端，监听 `0.0.0.0:9096`。
+- `qps_client`：支持多连接和可配置 Pipeline 的 RESP2 GET 基准客户端。
+- `legacy_client`：v0.1.0 文本协议历史客户端，不用于 v0.3.0 epoll 主服务。
 
-运行服务：
+运行服务时可选择统一命令背后的引擎，默认使用 Hash：
 
 ```bash
 ./kvstore
+./kvstore --engine hash
+./kvstore --engine rbtree
 ```
 
-NtyCo 只作为历史对照后端，不参与默认构建：
+NtyCo 只作为历史对照后端，不参与默认主线：
 
 ```bash
 git submodule update --init --recursive
 make ntyco
 ```
 
-该目标生成独立的 `kvstore-ntyco`，不会覆盖默认的 `kvstore` Reactor 服务端。
+## RESP2 协议与命令
 
-## 当前文本命令
-
-v0.2.0 保持 v0.1.0 的空格分隔协议：
+epoll 主服务只接受 RESP2 `Array of Bulk Strings` 请求，不接受 inline 文本命令。
+例如 `SET key value` 的字节帧为：
 
 ```text
-SET key value     GET key     DEL key     MOD key value     COUNT
-RSET key value    RGET key    RDEL key    RMOD key value    RCOUNT
-HSET key value    HGET key    HDEL key    HMOD key value    HCOUNT
+*3\r\n
+$3\r\nSET\r\n
+$3\r\nkey\r\n
+$5\r\nvalue\r\n
 ```
 
-无效命令或参数数量错误返回以 `ERROR` 开头的响应，不应导致服务崩溃。
+支持的命令和响应：
+
+| 命令 | 语义 | 响应 |
+| --- | --- | --- |
+| `SET key value` | 新增或覆盖 | `+OK` |
+| `GET key` | 查询 | Bulk String 或 Null Bulk |
+| `DEL key` | 删除 | Integer `1` 或 `0` |
+| `PING` | 探活 | `+PONG` |
+| `PING message` | 原样回显 | Bulk String |
+
+命令名大小写不敏感。key/value 和 PING message 均按长度处理，支持空数据与嵌入
+`NUL`。未知命令、参数数量错误和内部错误返回 RESP Error；非法、超限或 EOF 时仍
+不完整的协议帧返回 `-ERR Protocol error\r\n`，发送后关闭连接。
+
+当前协议限制：单帧最大 64 KiB、最多 128 个参数，只接受顶层 Array 和非 Null
+Bulk String。输出缓冲达到 1 MiB 高水位时 Reactor 暂停读取该连接，排空响应后再
+继续处理已缓存 Pipeline。
 
 ## 测试
 
@@ -70,41 +91,43 @@ make asan
 make valgrind
 ```
 
-- 单元测试覆盖缓冲区增长/消费、非阻塞部分写、三种 KV 引擎 CRUD 和错误输入。
-- 集成测试覆盖基础命令、多客户端并发、重复连接、异常断开和半关闭连接；
-  `make valgrind` 也会在 Valgrind 下重复该集成测试。
-- 性能测试必须记录 CPU/内存、编译选项、客户端和服务端位置、并发数、请求量与
-  持续时间。仓库当前不提供未经 Ubuntu 实测的 QPS 或延迟数字。
+- 单元测试覆盖动态网络缓冲、旧引擎接口、RESP 增量解析/编码，以及 Hash/RBTree
+  二进制安全的统一命令语义。
+- 集成测试会分别启动 Hash 和 RBTree，覆盖逐字节半包、粘连和跨发送 Pipeline、
+  超过 1 MiB 的响应背压、并发连接、二进制数据、half-close 和协议错误关闭。
+- `make asan` 使用 ASan/UBSan 重复单元与双引擎集成测试；`make valgrind` 对相同
+  主路径执行内存与资源检查。
 
 ## QPS 基准客户端
 
-`bench/legacy_client.c` 是 v0.1.0 留下的混合测试程序，命令数量和测试流程硬编码，
-主要用于兼容性对照。v0.2.0 使用独立的 `qps_client` 测量 Reactor：
-
 ```bash
 make qps_client
-./qps_client -s 127.0.0.1 -p 9096 -c 32 -n 1000000 -w 1000
+./qps_client -s 127.0.0.1 -p 9096 -c 32 -n 1000000 -w 1000 -P 1
+./qps_client -s 127.0.0.1 -p 9096 -c 32 -n 1000000 -w 1000 -P 16
 ```
 
 - `-c`：持久 TCP 连接数，同时也是客户端工作线程数。
-- `-n`：所有连接合计的实测请求数量，必须不少于连接数。
-- `-w`：每条连接在计时前执行的预热请求数。
+- `-n`：所有连接合计的计时 GET 数量，必须不少于连接数。
+- `-w`：每条连接在计时前执行的预热 GET 数量。
+- `-P`：每批 Pipeline 深度，范围 `1..1024`，默认 `1`。
 - `-s/-p`：服务端 IPv4 地址和端口。
 
-客户端先为每条连接写入独立 Hash key，再统一起跑并循环执行命中 `HGET`。每条连接
-保持一个在途请求，收到并校验完整响应后才发送下一条；建连、数据准备、预热和清理
-不计入 QPS。输出包含客户端主机名、并发数、请求数、持续时间和 QPS。
+每条连接先写入独立 key，再按 Pipeline 批次执行命中 GET，并逐个解析和校验 Bulk
+响应；准备、预热和清理不计入 QPS。对比 Hash/RBTree 时只切换服务端
+`--engine`，其余客户端参数、环境和数据必须保持相同。
 
-该测试不使用 Pipeline，因为 v0.2.0 尚无可靠的响应帧边界。正式性能报告还必须在
-结果旁记录服务端和客户端是否同机、CPU/内存、Ubuntu 版本、GCC 与优化选项；不要
-将短时本机 smoke test 当成正式性能数据。
+短时 smoke test 的输出不作为正式性能结论。正式报告必须记录 Ubuntu/GCC/编译
+选项、CPU/内存、客户端与服务端位置、引擎、并发数、Pipeline 深度、请求规模和
+持续时间。
 
-### v0.2.0 实测基线
+### v0.2.0 历史基线
 
-以下结果来自 VMware Ubuntu 22.04.5（8 核 CPU、12 GB 内存），客户端与服务端同机，
-使用 Makefile 默认编译选项 `-O2 -g -Wall -Wextra -Wpedantic`：
+以下数字仅是 v0.2.0 文本 `HGET`、无 Pipeline 的历史基线，不可直接作为 v0.3.0
+RESP 或 Hash/RBTree 对比结果：
 
 ```text
+environment: VMware Ubuntu 22.04.5, 8 CPU, 12 GB RAM, client/server same host
+compiler flags: -O2 -g -Wall -Wextra -Wpedantic
 workload: HGET hit, one request/response per connection
 connections: 32
 warmup_per_connection: 1000
@@ -114,12 +137,9 @@ qps: 72748.50
 tcp_nodelay: on
 ```
 
-这是指定环境和负载下的一次可复现实测基线，不代表其他机器、网络拓扑或请求分布下
-的峰值性能。
+## 当前范围与限制
 
-## v0.2.0 已知限制
-
-- 一次可读批次临时视为一条完整文本命令。
-- 尚不支持 RESP、增量协议解析、粘包、半包或 Pipeline；这些属于 v0.3.0。
-- 尚不支持 TTL/LRU、AOF 或 MySQL Cache-Aside。
-- 默认使用单线程、Level-Triggered epoll；不包含 ET、多线程 Reactor 或 io_uring。
+- v0.3.0 仅统一 Hash/RBTree 主服务；Array 和旧前缀命令只保留在历史代码路径。
+- 暂不支持 TTL/LRU、动态扩容、AOF、MySQL Cache-Aside、集群或复制。
+- 默认仍是单线程、Level-Triggered epoll；不包含多线程 Reactor 或 io_uring。
+- `feature/resp` 未完成全部发布级验证前，不应标记或宣称已经发布 v0.3.0。
