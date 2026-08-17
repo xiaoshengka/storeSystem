@@ -2,8 +2,8 @@
 
 基于 Linux C、非阻塞 Socket 与单线程 epoll Reactor 的内存 KV 服务。
 
-当前发布基线为 `v0.1.0`。`feature/reactor` 正在实现 `v0.2.0`；在 Ubuntu
-验收、合并和发布完成前，不将仓库描述为已发布 v0.2.0。
+当前发布版本为 `v0.2.0`，默认网络后端已经从 NtyCo 原型切换为非阻塞 Socket、
+Level-Triggered epoll 与单线程 Reactor。NtyCo 仅作为历史/可选对照实现保留。
 
 ## 架构
 
@@ -32,6 +32,7 @@ make
 
 - `kvstore`：epoll Reactor 服务端，监听 `0.0.0.0:9096`。
 - `legacy_client`：保留的原型测试/压测客户端。
+- `qps_client`：使用多条持久连接执行请求/响应校验的 QPS 基准客户端。
 
 运行服务：
 
@@ -97,6 +98,24 @@ make qps_client
 该测试不使用 Pipeline，因为 v0.2.0 尚无可靠的响应帧边界。正式性能报告还必须在
 结果旁记录服务端和客户端是否同机、CPU/内存、Ubuntu 版本、GCC 与优化选项；不要
 将短时本机 smoke test 当成正式性能数据。
+
+### v0.2.0 实测基线
+
+以下结果来自 VMware Ubuntu 22.04.5（8 核 CPU、12 GB 内存），客户端与服务端同机，
+使用 Makefile 默认编译选项 `-O2 -g -Wall -Wextra -Wpedantic`：
+
+```text
+workload: HGET hit, one request/response per connection
+connections: 32
+warmup_per_connection: 1000
+requests_completed: 1000000 / 1000000
+duration_seconds: 13.745987
+qps: 72748.50
+tcp_nodelay: on
+```
+
+这是指定环境和负载下的一次可复现实测基线，不代表其他机器、网络拓扑或请求分布下
+的峰值性能。
 
 ## v0.2.0 已知限制
 
