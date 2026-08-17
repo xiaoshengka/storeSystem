@@ -108,6 +108,18 @@ char* kvs_rbtree_get(rbtree_t *tree, char *key);
 int kvs_rbtree_delete(rbtree_t *tree, char *key);
 int kvs_rbtree_modify(rbtree_t *tree, char *key, char *value);
 int kvs_rbtree_count(rbtree_t *tree);
+int kvs_rbtree_upsert_bytes(rbtree_t *tree,
+                            const void *key,
+                            size_t key_length,
+                            const void *value,
+                            size_t value_length);
+const void *kvs_rbtree_get_bytes(rbtree_t *tree,
+                                 const void *key,
+                                 size_t key_length,
+                                 size_t *value_length);
+int kvs_rbtree_delete_bytes(rbtree_t *tree,
+                            const void *key,
+                            size_t key_length);
 
 #endif
 
@@ -139,6 +151,18 @@ char *kvs_hash_get(hashtable_t *hash, char *key);
 int kvs_hash_delete(hashtable_t *hash, char *key);
 int kvs_hash_modify(hashtable_t *hash, char *key, char *value);
 int kvs_hash_count(hashtable_t *hash);
+int kvs_hash_upsert_bytes(hashtable_t *hash,
+                          const void *key,
+                          size_t key_length,
+                          const void *value,
+                          size_t value_length);
+const void *kvs_hash_get_bytes(hashtable_t *hash,
+                               const void *key,
+                               size_t key_length,
+                               size_t *value_length);
+int kvs_hash_delete_bytes(hashtable_t *hash,
+                          const void *key,
+                          size_t key_length);
 
 
 #endif

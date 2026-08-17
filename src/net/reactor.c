@@ -22,6 +22,8 @@
 #define REACTOR_IO_CHUNK 4096U
 #define REACTOR_INITIAL_BUFFER 512U
 #define REACTOR_MAX_REQUEST (64U * 1024U)
+#define REACTOR_MAX_RESPONSE (REACTOR_MAX_REQUEST + 64U)
+#define REACTOR_OUTPUT_HIGH_WATER (1024U * 1024U)
 
 enum reactor_source_kind {
     REACTOR_SOURCE_LISTENER,
@@ -37,6 +39,7 @@ struct reactor_connection {
     int fd;
     uint32_t events;
     int peer_eof;
+    int close_after_write;
     net_buffer_t input;
     net_buffer_t output;
     reactor_connection_t *previous;
@@ -220,6 +223,9 @@ static int listener_create(uint16_t port)
 
 static int connection_set_events(reactor_connection_t *connection, uint32_t events)
 {
+    if (connection->events == events) {
+        return 0;
+    }
     if (reactor_modify(connection->owner, connection->fd, events, connection) != 0) {
         return -1;
     }
@@ -265,38 +271,65 @@ static int handle_accept(reactor_t *reactor)
     }
 }
 
-static int prepare_response(reactor_connection_t *connection)
+static int refresh_client_events(reactor_connection_t *connection)
 {
-    char response[REACTOR_MAX_REQUEST];
-    size_t response_length = 0;
-    int result;
+    uint32_t events = EPOLLRDHUP;
 
-    if (net_buffer_readable(&connection->input) == 0) {
-        return connection->peer_eof ? -1 : 0;
+    if (net_buffer_readable(&connection->output) > 0) {
+        events |= EPOLLOUT;
     }
+    if (!connection->peer_eof && !connection->close_after_write &&
+        net_buffer_readable(&connection->output) < REACTOR_OUTPUT_HIGH_WATER) {
+        events |= EPOLLIN;
+    }
+    return connection_set_events(connection, events);
+}
 
-    result = connection->owner->handler(
-        connection->input.data + connection->input.read_pos,
-        net_buffer_readable(&connection->input),
-        response,
-        sizeof(response),
-        &response_length,
-        connection->owner->handler_context);
-    net_buffer_reset(&connection->input);
+static int process_input(reactor_connection_t *connection)
+{
+    unsigned char response[REACTOR_MAX_RESPONSE];
 
-    if (response_length > sizeof(response)) {
-        errno = EOVERFLOW;
-        return -1;
+    while (net_buffer_readable(&connection->input) > 0 &&
+           net_buffer_readable(&connection->output) < REACTOR_OUTPUT_HIGH_WATER &&
+           !connection->close_after_write) {
+        size_t available = net_buffer_readable(&connection->input);
+        size_t consumed = 0;
+        size_t response_length = 0;
+        int close_after_response = 0;
+        int result = connection->owner->handler(
+            (const unsigned char *)connection->input.data + connection->input.read_pos,
+            available,
+            connection->peer_eof,
+            response,
+            sizeof(response),
+            &consumed,
+            &response_length,
+            &close_after_response,
+            connection->owner->handler_context);
+
+        if (result == REACTOR_HANDLER_INCOMPLETE) {
+            if (available > REACTOR_MAX_REQUEST) {
+                errno = EMSGSIZE;
+                return -1;
+            }
+            break;
+        }
+        if (result != REACTOR_HANDLER_COMPLETE || consumed == 0 ||
+            consumed > available || response_length > sizeof(response)) {
+            errno = EPROTO;
+            return -1;
+        }
+        net_buffer_consume(&connection->input, consumed);
+        if (response_length > 0 &&
+            net_buffer_append(&connection->output, response, response_length) != 0) {
+            return -1;
+        }
+        if (close_after_response) {
+            connection->close_after_write = 1;
+            net_buffer_reset(&connection->input);
+        }
     }
-    if (result != 0 && response_length == 0) {
-        static const char fallback[] = "ERROR";
-        memcpy(response, fallback, sizeof(fallback) - 1U);
-        response_length = sizeof(fallback) - 1U;
-    }
-    if (net_buffer_append(&connection->output, response, response_length) != 0) {
-        return -1;
-    }
-    return connection_set_events(connection, EPOLLOUT | EPOLLRDHUP);
+    return 0;
 }
 
 static int handle_read(reactor_connection_t *connection)
@@ -304,12 +337,15 @@ static int handle_read(reactor_connection_t *connection)
     char chunk[REACTOR_IO_CHUNK];
 
     for (;;) {
+        if (connection->close_after_write ||
+            net_buffer_readable(&connection->output) >= REACTOR_OUTPUT_HIGH_WATER) {
+            break;
+        }
         ssize_t received = recv(connection->fd, chunk, sizeof(chunk), 0);
 
         if (received > 0) {
-            if (net_buffer_readable(&connection->input) + (size_t)received > REACTOR_MAX_REQUEST ||
-                net_buffer_append(&connection->input, chunk, (size_t)received) != 0) {
-                errno = EMSGSIZE;
+            if (net_buffer_append(&connection->input, chunk, (size_t)received) != 0 ||
+                process_input(connection) != 0) {
                 return -1;
             }
             continue;
@@ -326,7 +362,10 @@ static int handle_read(reactor_connection_t *connection)
         }
         return -1;
     }
-    return prepare_response(connection);
+    if (process_input(connection) != 0) {
+        return -1;
+    }
+    return refresh_client_events(connection);
 }
 
 static int handle_write(reactor_connection_t *connection)
@@ -337,12 +376,18 @@ static int handle_write(reactor_connection_t *connection)
         return -1;
     }
     if (result == 0) {
-        return 0;
+        return refresh_client_events(connection);
     }
-    if (connection->peer_eof) {
+    if (connection->close_after_write) {
         return -1;
     }
-    return connection_set_events(connection, EPOLLIN | EPOLLRDHUP);
+    if (process_input(connection) != 0) {
+        return -1;
+    }
+    if (connection->peer_eof && net_buffer_readable(&connection->output) == 0) {
+        return -1;
+    }
+    return refresh_client_events(connection);
 }
 
 static void drain_wake_fd(reactor_t *reactor)

@@ -6,11 +6,20 @@
 
 typedef struct reactor reactor_t;
 
-typedef int (*reactor_request_handler)(const char *request,
-                                       size_t request_length,
-                                       char *response,
+enum reactor_handler_result {
+    REACTOR_HANDLER_ERROR = -1,
+    REACTOR_HANDLER_INCOMPLETE = 0,
+    REACTOR_HANDLER_COMPLETE = 1
+};
+
+typedef int (*reactor_request_handler)(const unsigned char *input,
+                                       size_t input_length,
+                                       int end_of_stream,
+                                       unsigned char *response,
                                        size_t response_capacity,
+                                       size_t *consumed,
                                        size_t *response_length,
+                                       int *close_after_response,
                                        void *context);
 
 int reactor_init(reactor_t **out_reactor,
