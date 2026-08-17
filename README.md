@@ -2,9 +2,9 @@
 
 基于 Linux C、非阻塞 Socket 与单线程 epoll Reactor 的内存 KV 服务。
 
-当前发布版本为 `v0.2.0`。`feature/resp` 正在开发 v0.3.0：为 epoll 主线增加
-RESP2 增量解析、可靠的粘包/半包处理、Pipeline，以及统一的
-`SET/GET/DEL/PING` 命令。NtyCo 仅作为历史/可选对照实现保留。
+当前发布版本为 `v0.3.0`：epoll 主线已支持 RESP2 增量解析、可靠的粘包/半包
+处理、Pipeline，以及统一的 `SET/GET/DEL/PING` 命令。NtyCo 仅作为历史/可选
+对照实现保留。
 
 ## 架构
 
@@ -19,7 +19,8 @@ Client
 Reactor 负责连接、输入/输出缓冲、非阻塞收发、Pipeline 背压和资源回收；协议层
 只处理 RESP 字节帧，服务层负责命令语义，引擎层不依赖网络或协议。v0.2.0 Reactor
 设计见 [`docs/reactor-v0.2.md`](docs/reactor-v0.2.md)，v0.3.0 协议设计见
-[`docs/resp-v0.3.md`](docs/resp-v0.3.md)。
+[`docs/resp-v0.3.md`](docs/resp-v0.3.md)，发布说明见
+[`docs/releases/v0.3.0.md`](docs/releases/v0.3.0.md)。
 
 ## 环境与构建
 
@@ -142,4 +143,4 @@ tcp_nodelay: on
 - v0.3.0 仅统一 Hash/RBTree 主服务；Array 和旧前缀命令只保留在历史代码路径。
 - 暂不支持 TTL/LRU、动态扩容、AOF、MySQL Cache-Aside、集群或复制。
 - 默认仍是单线程、Level-Triggered epoll；不包含多线程 Reactor 或 io_uring。
-- `feature/resp` 未完成全部发布级验证前，不应标记或宣称已经发布 v0.3.0。
+- v0.4.0 计划中的动态扩容、TTL/LRU 与缓存统计尚未实现。
