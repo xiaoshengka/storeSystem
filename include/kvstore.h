@@ -13,7 +13,7 @@
 #define NETWORK_NTYCO 1
 #define NETWORK_IOURING 2
 
-#define ENABLE_NETWORK_SELECT NETWORK_NTYCO
+#define ENABLE_NETWORK_SELECT NETWORK_EPOLL
 
 #define ENABLE_ARRAY_KVENGINE 1
 #define ENABLE_RBTREE_KVENGINE 1
@@ -61,14 +61,13 @@ struct conn_item{
 }; 
 
 
-int epoll_entry(void);
 int ntyco_entry(void);
 
 
 int kvstore_request(struct conn_item *item);
 
 void *kvstore_malloc(size_t size);
-void *kvstore_free(void *ptr);
+void kvstore_free(void *ptr);
 
 #if ENABLE_ARRAY_KVENGINE
 
