@@ -35,16 +35,22 @@ BUFFER_TEST_OBJS := $(BUFFER_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
 KV_TEST_SRCS := tests/test_kvstore.c $(SERVICE_SRCS) $(ENGINE_SRCS)
 KV_TEST_OBJS := $(KV_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
 LEGACY_CLIENT_OBJ := $(BUILD_DIR)/bench/legacy_client.o
+QPS_CLIENT_OBJ := $(BUILD_DIR)/bench/qps_client.o
 
 .PHONY: all clean test integration-test asan valgrind valgrind-run ntyco
 
-all: $(SERVER_TARGET) legacy_client
+all: $(SERVER_TARGET) legacy_client qps_client
 
 $(SERVER_TARGET): $(SERVER_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 legacy_client: $(LEGACY_CLIENT_OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+qps_client: $(QPS_CLIENT_OBJ)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS) -pthread
+
+$(QPS_CLIENT_OBJ): CFLAGS += -pthread
 
 test_buffer: $(BUFFER_TEST_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
@@ -88,4 +94,4 @@ $(BUILD_DIR)/%.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -rf build kvstore kvstore-ntyco legacy_client test_buffer test_kvstore
+	rm -rf build kvstore kvstore-ntyco legacy_client qps_client test_buffer test_kvstore
