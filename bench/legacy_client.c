@@ -177,8 +177,6 @@ int connect_tcpserver(const char *ip, unsigned short port){
 // ./testcase -s 192.168.232.129 -p 9096 -m 1
 int main(int argc, char *argv[])
 {
-  int ret = 0;
-  
   char ip[16] = {0};
   int port = 0;
   int mode = 1;
