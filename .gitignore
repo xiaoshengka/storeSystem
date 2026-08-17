@@ -1,1 +1,31 @@
+# Local Codex/project instructions
+AGENTS.md
+
+# Build directories and generated binaries
+build/
+kvstore
+kvstore-ntyco
+legacy_client
+qps_client
+test_buffer
+test_kvstore
+*.o
+*.a
+
+# Runtime and test artifacts
+*.log
+core
+core.*
+__pycache__/
+*.py[cod]
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Historical NtyCo submodule working files
 NtyCo/**
