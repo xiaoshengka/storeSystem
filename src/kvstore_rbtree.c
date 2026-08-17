@@ -2,6 +2,7 @@
 
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,6 +32,8 @@ typedef struct _rbtree_node {
 
 	KEY_TYPE key;
 	void *value;
+	size_t key_length;
+	size_t value_length;
 } rbtree_node;
 
 typedef struct _rbtree {
@@ -39,6 +42,32 @@ typedef struct _rbtree {
 	
 	int count;
 } rbtree;
+
+static int valid_bytes(const void *data, size_t length) {
+	return data != NULL || length == 0;
+}
+
+static int compare_bytes(const void *left, size_t left_length,
+						 const void *right, size_t right_length) {
+	size_t common = left_length < right_length ? left_length : right_length;
+	int result = common > 0 ? memcmp(left, right, common) : 0;
+
+	if (result != 0) return result;
+	if (left_length < right_length) return -1;
+	if (left_length > right_length) return 1;
+	return 0;
+}
+
+static unsigned char *copy_bytes(const void *data, size_t length) {
+	unsigned char *copy;
+
+	if (length == SIZE_MAX) return NULL;
+	copy = kvstore_malloc(length + 1U);
+	if (copy == NULL) return NULL;
+	if (length > 0) memcpy(copy, data, length);
+	copy[length] = '\0';
+	return copy;
+}
 
 
 
@@ -174,9 +203,9 @@ int rbtree_insert(rbtree *T, rbtree_node *z) {
 	while (x != T->nil) {
 		y = x;
 #if ENABLE_KEY_CHAR
-		if (strcmp(z->key, x->key) < 0) {
+		if (compare_bytes(z->key, z->key_length, x->key, x->key_length) < 0) {
 			x = x->left;
-		} else if (strcmp(z->key, x->key) > 0) {
+		} else if (compare_bytes(z->key, z->key_length, x->key, x->key_length) > 0) {
 			x = x->right;
 		} else {
 			return 1;
@@ -197,7 +226,7 @@ int rbtree_insert(rbtree *T, rbtree_node *z) {
 	if (y == T->nil) {
 		T->root = z;
 #if ENABLE_KEY_CHAR
-	} else if (strcmp(z->key, y->key) < 0) {
+	} else if (compare_bytes(z->key, z->key_length, y->key, y->key_length) < 0) {
 #else
 	} else if (z->key < y->key) {
 #endif
@@ -322,6 +351,15 @@ rbtree_node *rbtree_delete(rbtree *T, rbtree_node *z) {
 		tmp = z->value;
 		z->value = y->value;
 		y->value = tmp;
+
+		{
+			size_t length = z->key_length;
+			z->key_length = y->key_length;
+			y->key_length = length;
+			length = z->value_length;
+			z->value_length = y->value_length;
+			y->value_length = length;
+		}
 #else
 		z->key = y->key;
 		z->value = y->value;
@@ -337,15 +375,15 @@ rbtree_node *rbtree_delete(rbtree *T, rbtree_node *z) {
 
 
 // int --> char *
-rbtree_node *rbtree_search(rbtree *T, KEY_TYPE key) {
+rbtree_node *rbtree_search_bytes(rbtree *T, const void *key, size_t key_length) {
 
 	rbtree_node *node = T->root;
 	while (node != T->nil) {
 		
 #if ENABLE_KEY_CHAR
-		if (strcmp(key, node->key) < 0) {
+		if (compare_bytes(key, key_length, node->key, node->key_length) < 0) {
 			node = node->left;
-		} else if (strcmp(key, node->key) > 0) {
+		} else if (compare_bytes(key, key_length, node->key, node->key_length) > 0) {
 			node = node->right;
 		} else {
 			return node;
@@ -361,6 +399,10 @@ rbtree_node *rbtree_search(rbtree *T, KEY_TYPE key) {
 #endif
 	}
 	return T->nil;
+}
+
+rbtree_node *rbtree_search(rbtree *T, KEY_TYPE key) {
+	return rbtree_search_bytes(T, key, strlen(key));
 }
 
 
@@ -392,6 +434,8 @@ int kvstore_rbtree_create(rbtree *tree) {
 		return -1;
 	}
 	*(tree->nil->key) = '\0';
+	tree->nil->key_length = 0;
+	tree->nil->value_length = 0;
 	
 	
 	tree->nil->color = BLACK;
@@ -444,23 +488,20 @@ int kvs_rbtree_set(rbtree *tree, char *key, char *value) {
 	node  = (rbtree_node*)kvstore_malloc(sizeof(rbtree_node));
 	if (!node) return -1;
 
-	node->key = kvstore_malloc(strlen(key) + 1);
+	node->key_length = strlen(key);
+	node->value_length = strlen(value);
+	node->key = (char *)copy_bytes(key, node->key_length);
 	if (node->key == NULL) {
 		kvstore_free(node);
 		return -1;
 	}
 	
-	memset(node->key, 0, strlen(key) + 1);
-	strcpy(node->key, key);
-	
-	node->value = kvstore_malloc(strlen(value) + 1);
+	node->value = copy_bytes(value, node->value_length);
 	if (node->value == NULL) {
 		kvstore_free(node->key);
 		kvstore_free(node);
 		return -1;
 	}
-	memset(node->value, 0, strlen(value) + 1);
-	strcpy((char *)node->value, value);
 
 	insert_result = rbtree_insert(tree, node);
 	if (insert_result != 0) {
@@ -525,6 +566,7 @@ int kvs_rbtree_modify(rbtree *tree, char *key, char *value) {
 	strcpy(replacement, value);
 	kvstore_free(node->value);
 	node->value = replacement;
+	node->value_length = strlen(value);
 
 	return 0;
 }
@@ -533,6 +575,88 @@ int kvs_rbtree_count(rbtree *tree) {
 
 	return tree ? tree->count : -1;
 
+}
+
+int kvs_rbtree_upsert_bytes(rbtree *tree,
+							const void *key,
+							size_t key_length,
+							const void *value,
+							size_t value_length) {
+	rbtree_node *node;
+	unsigned char *replacement;
+	int insert_result;
+
+	if (!tree || !tree->nil || !valid_bytes(key, key_length) ||
+		!valid_bytes(value, value_length)) return -1;
+	node = rbtree_search_bytes(tree, key, key_length);
+	if (node != tree->nil) {
+		replacement = copy_bytes(value, value_length);
+		if (replacement == NULL) return -1;
+		kvstore_free(node->value);
+		node->value = replacement;
+		node->value_length = value_length;
+		return 0;
+	}
+
+	node = kvstore_malloc(sizeof(*node));
+	if (node == NULL) return -1;
+	memset(node, 0, sizeof(*node));
+	node->key = (char *)copy_bytes(key, key_length);
+	if (node->key == NULL) {
+		kvstore_free(node);
+		return -1;
+	}
+	node->value = copy_bytes(value, value_length);
+	if (node->value == NULL) {
+		kvstore_free(node->key);
+		kvstore_free(node);
+		return -1;
+	}
+	node->key_length = key_length;
+	node->value_length = value_length;
+	insert_result = rbtree_insert(tree, node);
+	if (insert_result != 0) {
+		kvstore_free(node->key);
+		kvstore_free(node->value);
+		kvstore_free(node);
+		return -1;
+	}
+	tree->count++;
+	return 0;
+}
+
+const void *kvs_rbtree_get_bytes(rbtree *tree,
+								 const void *key,
+								 size_t key_length,
+								 size_t *value_length) {
+	rbtree_node *node;
+
+	if (!tree || !tree->nil || value_length == NULL ||
+		!valid_bytes(key, key_length)) return NULL;
+	*value_length = 0;
+	node = rbtree_search_bytes(tree, key, key_length);
+	if (node == tree->nil) return NULL;
+	*value_length = node->value_length;
+	return node->value;
+}
+
+int kvs_rbtree_delete_bytes(rbtree *tree,
+							const void *key,
+							size_t key_length) {
+	rbtree_node *node;
+	rbtree_node *removed;
+
+	if (!tree || !tree->nil || !valid_bytes(key, key_length)) return -1;
+	node = rbtree_search_bytes(tree, key, key_length);
+	if (node == tree->nil) return 0;
+	removed = rbtree_delete(tree, node);
+	if (removed != NULL) {
+		kvstore_free(removed->key);
+		kvstore_free(removed->value);
+		kvstore_free(removed);
+	}
+	tree->count--;
+	return 1;
 }
 
 
