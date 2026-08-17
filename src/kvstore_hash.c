@@ -1,342 +1,352 @@
-
-
-
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <pthread.h>
-
 #include "kvstore.h"
 
+#include <stdint.h>
+#include <string.h>
 
-#define MAX_KEY_LEN	128
-#define MAX_VALUE_LEN	512
-
-
-#define MAX_TABLE_SIZE	102400
-
-#define ENABLE_POINTER_KEY	1
-
+#define MAX_TABLE_SIZE 102400
 
 typedef struct hashnode_s {
-#if ENABLE_POINTER_KEY
-	char *key;
-	char *value;
-#else
-	char key[MAX_KEY_LEN];
-	char value[MAX_VALUE_LEN];
-#endif	
-	struct hashnode_s *next;
-	
+    unsigned char *key;
+    size_t key_length;
+    unsigned char *value;
+    size_t value_length;
+    struct hashnode_s *next;
 } hashnode_t;
 
-
-typedef struct hashtable_s {
-
-	hashnode_t **nodes; //* change **, 
-
-	int max_slots;
-	int count;
-
-} hashtable_t;
-
+struct hashtable_s {
+    hashnode_t **nodes;
+    int max_slots;
+    int count;
+};
 
 hashtable_t Hash;
 
-
-//Connection 
-// 'C' + 'o' + 'n'
-// key: Name0  --> Name50000
-
-static int _hash(char *key, int size) {
-
-	const unsigned char *cursor;
-	unsigned long hash_value = 5381U;
-
-	if (!key || size <= 0) return -1;
-	cursor = (const unsigned char *)key;
-	while (*cursor != 0U) {
-		hash_value = ((hash_value << 5U) + hash_value) + *cursor;
-		cursor++;
-	}
-
-	return (int)(hash_value % (unsigned long)size);
-
+static int valid_bytes(const void *data, size_t length)
+{
+    return data != NULL || length == 0;
 }
 
-hashnode_t *_create_node(char *key, char *value) {
+static size_t hash_bytes(const void *key, size_t key_length, size_t slot_count)
+{
+    const unsigned char *cursor = key;
+    size_t index;
+    uint64_t value = 5381U;
 
-	hashnode_t *node = (hashnode_t*)kvstore_malloc(sizeof(hashnode_t));
-	if (!node) return NULL;
-
-#if ENABLE_POINTER_KEY
-
-	node->key = kvstore_malloc(strlen(key) + 1);
-	if (!node->key) {
-		kvstore_free(node);
-		return NULL;
-	}
-	strcpy(node->key, key);
-
-	node->value = kvstore_malloc(strlen(value) + 1);
-	if (!node->value) {
-		kvstore_free(node->key);
-		kvstore_free(node);
-		return NULL;
-	}
-	strcpy(node->value, value);
-
-#else
-
-	strncpy(node->key, key, MAX_KEY_LEN);
-	strncpy(node->value, value, MAX_VALUE_LEN);
-	
-#endif
-
-	node->next = NULL;
-
-	return node;
+    for (index = 0; index < key_length; ++index) {
+        value = ((value << 5U) + value) + cursor[index];
+    }
+    return (size_t)(value % slot_count);
 }
 
-
-//
-int init_hashtable(hashtable_t *hash) {
-
-	if (!hash) return -1;
-
-	hash->nodes = (hashnode_t**)kvstore_malloc(sizeof(hashnode_t*) * MAX_TABLE_SIZE);
-	if (!hash->nodes) return -1;
-	memset(hash->nodes, 0, sizeof(hashnode_t*) * MAX_TABLE_SIZE);
-
-	hash->max_slots = MAX_TABLE_SIZE;
-	hash->count = 0; 
-
-	return 0;
+static int key_equals(const hashnode_t *node, const void *key, size_t key_length)
+{
+    return node->key_length == key_length &&
+           (key_length == 0 || memcmp(node->key, key, key_length) == 0);
 }
 
-// 
-void dest_hashtable(hashtable_t *hash) {
+static unsigned char *copy_bytes(const void *data, size_t length)
+{
+    unsigned char *copy;
 
-	if (!hash || !hash->nodes) return;
-
-	int i = 0;
-	for (i = 0;i < hash->max_slots;i ++) {
-		hashnode_t *node = hash->nodes[i];
-
-		while (node != NULL) { // error
-
-			hashnode_t *tmp = node;
-			node = node->next;
-			hash->nodes[i] = node;
-			
-			kvstore_free(tmp->key);
-			kvstore_free(tmp->value);
-			kvstore_free(tmp);
-			
-		}
-	}
-
-	kvstore_free(hash->nodes);
-	hash->nodes = NULL;
-	hash->max_slots = 0;
-	hash->count = 0;
-	
+    if (length == SIZE_MAX) {
+        return NULL;
+    }
+    copy = kvstore_malloc(length + 1U);
+    if (copy == NULL) {
+        return NULL;
+    }
+    if (length > 0) {
+        memcpy(copy, data, length);
+    }
+    copy[length] = '\0';
+    return copy;
 }
 
+static hashnode_t *create_node(const void *key,
+                               size_t key_length,
+                               const void *value,
+                               size_t value_length)
+{
+    hashnode_t *node = kvstore_malloc(sizeof(*node));
 
-
-// mp
-int put_kv_hashtable(hashtable_t *hash, char *key, char *value) {
-
-	if (!hash || !key || !value) return -1;
-
-	int idx = _hash(key, hash->max_slots);
-
-	hashnode_t *node = hash->nodes[idx];
-#if 1
-	while (node != NULL) {
-		if (strcmp(node->key, key) == 0) { // exist
-			return 1;
-		}
-		node = node->next;
-	}
-#endif
-
-	hashnode_t *new_node = _create_node(key, value);
-	if (!new_node) return -1;
-	new_node->next = hash->nodes[idx];
-	hash->nodes[idx] = new_node;
-	
-	hash->count ++;
-
-	return 0;
+    if (node == NULL) {
+        return NULL;
+    }
+    memset(node, 0, sizeof(*node));
+    node->key = copy_bytes(key, key_length);
+    if (node->key == NULL) {
+        kvstore_free(node);
+        return NULL;
+    }
+    node->value = copy_bytes(value, value_length);
+    if (node->value == NULL) {
+        kvstore_free(node->key);
+        kvstore_free(node);
+        return NULL;
+    }
+    node->key_length = key_length;
+    node->value_length = value_length;
+    return node;
 }
 
+static hashnode_t *find_node(hashtable_t *hash,
+                             const void *key,
+                             size_t key_length,
+                             size_t *slot)
+{
+    hashnode_t *node;
+    size_t index;
 
-char * get_kv_hashtable(hashtable_t *hash, char *key) {
-
-	if (!hash || !key) return NULL;
-
-	int idx = _hash(key, hash->max_slots);
-
-	hashnode_t *node = hash->nodes[idx];
-
-	while (node != NULL) {
-
-		if (strcmp(node->key, key) == 0) {
-			return node->value;
-		}
-
-		node = node->next;
-	}
-
-
-	return NULL;
-
+    if (hash == NULL || hash->nodes == NULL || hash->max_slots <= 0 ||
+        !valid_bytes(key, key_length)) {
+        return NULL;
+    }
+    index = hash_bytes(key, key_length, (size_t)hash->max_slots);
+    if (slot != NULL) {
+        *slot = index;
+    }
+    node = hash->nodes[index];
+    while (node != NULL) {
+        if (key_equals(node, key, key_length)) {
+            return node;
+        }
+        node = node->next;
+    }
+    return NULL;
 }
 
+static int set_bytes(hashtable_t *hash,
+                     const void *key,
+                     size_t key_length,
+                     const void *value,
+                     size_t value_length,
+                     int overwrite)
+{
+    hashnode_t *node;
+    size_t slot = 0;
 
-int count_kv_hashtable(hashtable_t *hash) {
-	return hash ? hash->count : -1;
+    if (hash == NULL || hash->nodes == NULL || !valid_bytes(key, key_length) ||
+        !valid_bytes(value, value_length)) {
+        return -1;
+    }
+    node = find_node(hash, key, key_length, &slot);
+    if (node != NULL) {
+        unsigned char *replacement;
+
+        if (!overwrite) {
+            return 1;
+        }
+        replacement = copy_bytes(value, value_length);
+        if (replacement == NULL) {
+            return -1;
+        }
+        kvstore_free(node->value);
+        node->value = replacement;
+        node->value_length = value_length;
+        return 0;
+    }
+
+    node = create_node(key, key_length, value, value_length);
+    if (node == NULL) {
+        return -1;
+    }
+    node->next = hash->nodes[slot];
+    hash->nodes[slot] = node;
+    hash->count++;
+    return 0;
 }
 
-int delete_kv_hashtable(hashtable_t *hash, char *key) {
-	if (!hash || !key) return -2;
-
-	int idx = _hash(key, hash->max_slots);
-
-	hashnode_t *head = hash->nodes[idx];
-	if (head == NULL) return -1; // noexist
-	// head node
-	if (strcmp(head->key, key) == 0) {
-		hashnode_t *tmp = head->next;
-		hash->nodes[idx] = tmp;
-
-#if ENABLE_POINTER_KEY
-		if (head->key) {
-			kvstore_free(head->key);
-		}
-		if (head->value) {
-			kvstore_free(head->value);
-		}
-		kvstore_free(head);
-#else
-		free(head);
-#endif
-		hash->count --;
-
-		return 0;
-	}
-
-	hashnode_t *cur = head;
-	while (cur->next != NULL) {
-		if (strcmp(cur->next->key, key) == 0) break; // search node
-		
-		cur = cur->next;
-	}
-
-	if (cur->next == NULL) {
-		
-		return -1;
-	}
-
-	hashnode_t *tmp = cur->next;
-	cur->next = tmp->next;
-#if ENABLE_POINTER_KEY
-	if (tmp->key) {
-		kvstore_free(tmp->key);
-	}
-	if (tmp->value) {
-		kvstore_free(tmp->value);
-	}
-	kvstore_free(tmp);
-#else
-	free(tmp);
-#endif
-	hash->count --;
-
-	return 0;
+int init_hashtable(hashtable_t *hash)
+{
+    if (hash == NULL) {
+        return -1;
+    }
+    hash->nodes = kvstore_malloc(sizeof(*hash->nodes) * MAX_TABLE_SIZE);
+    if (hash->nodes == NULL) {
+        return -1;
+    }
+    memset(hash->nodes, 0, sizeof(*hash->nodes) * MAX_TABLE_SIZE);
+    hash->max_slots = MAX_TABLE_SIZE;
+    hash->count = 0;
+    return 0;
 }
 
+void dest_hashtable(hashtable_t *hash)
+{
+    int index;
 
-int exist_kv_hashtable(hashtable_t *hash, char *key) {
+    if (hash == NULL || hash->nodes == NULL) {
+        return;
+    }
+    for (index = 0; index < hash->max_slots; ++index) {
+        hashnode_t *node = hash->nodes[index];
 
-	char *value = get_kv_hashtable(hash, key);
-	if (value) return 1;
-	else return 0;
-	
+        while (node != NULL) {
+            hashnode_t *next = node->next;
+
+            kvstore_free(node->key);
+            kvstore_free(node->value);
+            kvstore_free(node);
+            node = next;
+        }
+    }
+    kvstore_free(hash->nodes);
+    hash->nodes = NULL;
+    hash->max_slots = 0;
+    hash->count = 0;
 }
 
-
-
-
-// 5 + 2
-
-int kvstore_hash_create(hashtable_t *hash) {
-
-	return init_hashtable(hash);
-	
+int put_kv_hashtable(hashtable_t *hash, char *key, char *value)
+{
+    if (key == NULL || value == NULL) {
+        return -1;
+    }
+    return set_bytes(hash, key, strlen(key), value, strlen(value), 0);
 }
 
+char *get_kv_hashtable(hashtable_t *hash, char *key)
+{
+    hashnode_t *node;
 
-void kvstore_hash_destory(hashtable_t *hash) {
-
-	dest_hashtable(hash);
-
+    if (key == NULL) {
+        return NULL;
+    }
+    node = find_node(hash, key, strlen(key), NULL);
+    return node != NULL ? (char *)node->value : NULL;
 }
 
-
-int kvs_hash_set(hashtable_t *hash, char *key, char *value) {
-
-	return put_kv_hashtable(hash, key, value);
-
+int count_kv_hashtable(hashtable_t *hash)
+{
+    return hash != NULL ? hash->count : -1;
 }
 
+int delete_kv_hashtable(hashtable_t *hash, char *key)
+{
+    int result;
 
-char *kvs_hash_get(hashtable_t *hash, char *key) {
-
-	return get_kv_hashtable(hash, key);
-
+    if (hash == NULL || key == NULL) {
+        return -2;
+    }
+    result = kvs_hash_delete_bytes(hash, key, strlen(key));
+    return result == 1 ? 0 : -1;
 }
 
-int kvs_hash_delete(hashtable_t *hash, char *key) {
-
-	return delete_kv_hashtable(hash, key);
-
+int exist_kv_hashtable(hashtable_t *hash, char *key)
+{
+    return get_kv_hashtable(hash, key) != NULL;
 }
 
-
-int kvs_hash_modify(hashtable_t *hash, char *key, char *value) {
-
-	if (!hash || !key || !value) return -1;
-
-	int idx = _hash(key, hash->max_slots);
-
-	hashnode_t *node = hash->nodes[idx];
-
-	while (node != NULL) {
-
-		if (strcmp(node->key, key) == 0) {
-			char *replacement = kvstore_malloc(strlen(value) + 1);
-			if (!replacement) return -1;
-			strcpy(replacement, value);
-			kvstore_free(node->value);
-			node->value = replacement;
-			return 0;
-		}
-
-		node = node->next;
-	}
-
-
-	return -1;
-
+int kvstore_hash_create(hashtable_t *hash)
+{
+    return init_hashtable(hash);
 }
 
-int kvs_hash_count(hashtable_t *hash) {
-	return hash ? hash->count : -1;
+void kvstore_hash_destory(hashtable_t *hash)
+{
+    dest_hashtable(hash);
 }
 
+int kvs_hash_set(hashtable_t *hash, char *key, char *value)
+{
+    return put_kv_hashtable(hash, key, value);
+}
 
+char *kvs_hash_get(hashtable_t *hash, char *key)
+{
+    return get_kv_hashtable(hash, key);
+}
 
+int kvs_hash_delete(hashtable_t *hash, char *key)
+{
+    return delete_kv_hashtable(hash, key);
+}
 
+int kvs_hash_modify(hashtable_t *hash, char *key, char *value)
+{
+    hashnode_t *node;
+    unsigned char *replacement;
+    size_t value_length;
+
+    if (hash == NULL || key == NULL || value == NULL) {
+        return -1;
+    }
+    node = find_node(hash, key, strlen(key), NULL);
+    if (node == NULL) {
+        return -1;
+    }
+    value_length = strlen(value);
+    replacement = copy_bytes(value, value_length);
+    if (replacement == NULL) {
+        return -1;
+    }
+    kvstore_free(node->value);
+    node->value = replacement;
+    node->value_length = value_length;
+    return 0;
+}
+
+int kvs_hash_count(hashtable_t *hash)
+{
+    return hash != NULL ? hash->count : -1;
+}
+
+int kvs_hash_upsert_bytes(hashtable_t *hash,
+                          const void *key,
+                          size_t key_length,
+                          const void *value,
+                          size_t value_length)
+{
+    return set_bytes(hash, key, key_length, value, value_length, 1);
+}
+
+const void *kvs_hash_get_bytes(hashtable_t *hash,
+                               const void *key,
+                               size_t key_length,
+                               size_t *value_length)
+{
+    hashnode_t *node;
+
+    if (value_length == NULL) {
+        return NULL;
+    }
+    *value_length = 0;
+    node = find_node(hash, key, key_length, NULL);
+    if (node == NULL) {
+        return NULL;
+    }
+    *value_length = node->value_length;
+    return node->value;
+}
+
+int kvs_hash_delete_bytes(hashtable_t *hash,
+                          const void *key,
+                          size_t key_length)
+{
+    hashnode_t *node;
+    hashnode_t *previous = NULL;
+    size_t slot;
+
+    if (hash == NULL || hash->nodes == NULL || hash->max_slots <= 0 ||
+        !valid_bytes(key, key_length)) {
+        return -1;
+    }
+    slot = hash_bytes(key, key_length, (size_t)hash->max_slots);
+    node = hash->nodes[slot];
+    while (node != NULL && !key_equals(node, key, key_length)) {
+        previous = node;
+        node = node->next;
+    }
+    if (node == NULL) {
+        return 0;
+    }
+    if (previous == NULL) {
+        hash->nodes[slot] = node->next;
+    } else {
+        previous->next = node->next;
+    }
+    kvstore_free(node->key);
+    kvstore_free(node->value);
+    kvstore_free(node);
+    hash->count--;
+    return 1;
+}

@@ -9,6 +9,8 @@ legacy_client
 qps_client
 test_buffer
 test_kvstore
+test_resp
+test_resp_service
 *.o
 *.a
 

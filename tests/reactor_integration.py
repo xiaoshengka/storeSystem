@@ -7,10 +7,68 @@ import socket
 import subprocess
 import sys
 import time
+from typing import Sequence, Tuple, Union
 
 
 HOST = "127.0.0.1"
 PORT = 9096
+RespValue = Tuple[str, Union[bytes, int, None]]
+
+
+def encode_command(*arguments: bytes) -> bytes:
+    parts = [f"*{len(arguments)}\r\n".encode("ascii")]
+    for argument in arguments:
+        parts.append(f"${len(argument)}\r\n".encode("ascii"))
+        parts.append(argument)
+        parts.append(b"\r\n")
+    return b"".join(parts)
+
+
+class RespReader:
+    def __init__(self, client: socket.socket):
+        self.client = client
+        self.buffer = bytearray()
+
+    def _receive(self) -> None:
+        chunk = self.client.recv(65536)
+        if not chunk:
+            raise ConnectionError("server closed before a complete RESP response")
+        self.buffer.extend(chunk)
+
+    def _line(self, start: int) -> Tuple[bytes, int]:
+        while True:
+            end = self.buffer.find(b"\r\n", start)
+            if end >= 0:
+                return bytes(self.buffer[start:end]), end + 2
+            self._receive()
+
+    def read(self) -> RespValue:
+        while not self.buffer:
+            self._receive()
+        prefix = self.buffer[0]
+        if prefix in (ord("+"), ord("-"), ord(":")):
+            line, end = self._line(1)
+            del self.buffer[:end]
+            if prefix == ord("+"):
+                return "simple", line
+            if prefix == ord("-"):
+                return "error", line
+            return "integer", int(line)
+        if prefix == ord("$"):
+            line, payload_start = self._line(1)
+            length = int(line)
+            if length == -1:
+                del self.buffer[:payload_start]
+                return "bulk", None
+            required = payload_start + length + 2
+            while len(self.buffer) < required:
+                self._receive()
+            if self.buffer[payload_start + length:required] != b"\r\n":
+                raise AssertionError("invalid bulk response terminator")
+            payload = bytes(self.buffer[payload_start:payload_start + length])
+            del self.buffer[:required]
+            return "bulk", payload
+        raise AssertionError(f"unexpected RESP response prefix: {prefix!r}")
 
 
 def wait_for_server(process: subprocess.Popen, timeout: float = 5.0) -> None:
@@ -26,46 +84,136 @@ def wait_for_server(process: subprocess.Popen, timeout: float = 5.0) -> None:
     raise TimeoutError("server did not listen on port 9096")
 
 
-def request(command: str, half_close: bool = False) -> str:
-    with socket.create_connection((HOST, PORT), timeout=2.0) as client:
-        client.settimeout(2.0)
-        client.sendall(command.encode("ascii"))
+def connect() -> socket.socket:
+    client = socket.create_connection((HOST, PORT), timeout=3.0)
+    client.settimeout(5.0)
+    return client
+
+
+def exchange(arguments: Sequence[bytes], half_close: bool = False) -> RespValue:
+    with connect() as client:
+        client.sendall(encode_command(*arguments))
         if half_close:
             client.shutdown(socket.SHUT_WR)
-        return client.recv(4096).decode("ascii")
+        return RespReader(client).read()
+
+
+def expect_protocol_error(payload: bytes, half_close: bool = False) -> None:
+    with connect() as client:
+        client.sendall(payload)
+        if half_close:
+            client.shutdown(socket.SHUT_WR)
+        reader = RespReader(client)
+        assert reader.read() == ("error", b"ERR Protocol error")
+        assert client.recv(1) == b""
+
+
+def test_basic_and_binary() -> None:
+    key = b"binary\x00key"
+    value = b"value\x00one"
+    replacement = b"value\x00two\x00"
+
+    assert exchange([b"PING"]) == ("simple", b"PONG")
+    assert exchange([b"ping", b"hello\x00world"]) == (
+        "bulk", b"hello\x00world"
+    )
+    assert exchange([b"SET", key, value]) == ("simple", b"OK")
+    assert exchange([b"GET", key]) == ("bulk", value)
+    assert exchange([b"set", key, replacement]) == ("simple", b"OK")
+    assert exchange([b"GET", key]) == ("bulk", replacement)
+    assert exchange([b"DEL", key]) == ("integer", 1)
+    assert exchange([b"DEL", key]) == ("integer", 0)
+    assert exchange([b"GET", key]) == ("bulk", None)
+    assert exchange([b"SET", b"", b""]) == ("simple", b"OK")
+    assert exchange([b"GET", b""]) == ("bulk", b"")
+    assert exchange([b"UNKNOWN"]) == ("error", b"ERR unknown command")
+    assert exchange([b"GET"]) == ("error", b"ERR wrong number of arguments")
+    assert exchange([b"HGET", b"key"]) == ("error", b"ERR unknown command")
+    assert exchange([b"PING"], half_close=True) == ("simple", b"PONG")
+
+
+def test_fragmentation_and_pipeline() -> None:
+    fragmented = encode_command(b"SET", b"fragmented", b"works")
+    with connect() as client:
+        reader = RespReader(client)
+        for byte in fragmented:
+            client.sendall(bytes([byte]))
+            time.sleep(0.0005)
+        assert reader.read() == ("simple", b"OK")
+
+    commands = [
+        encode_command(b"GET", b"fragmented"),
+        encode_command(b"PING"),
+        encode_command(b"DEL", b"fragmented"),
+        encode_command(b"GET", b"fragmented"),
+    ]
+    payload = b"".join(commands)
+    with connect() as client:
+        reader = RespReader(client)
+        for start in range(0, len(payload), 7):
+            client.sendall(payload[start:start + 7])
+        assert [reader.read() for _ in commands] == [
+            ("bulk", b"works"),
+            ("simple", b"PONG"),
+            ("integer", 1),
+            ("bulk", None),
+        ]
+
+
+def test_large_pipeline_backpressure() -> None:
+    key = b"large-pipeline"
+    value = bytes(range(256)) * 128  # 32 KiB, including many NUL bytes.
+    count = 40  # Responses exceed the Reactor's 1 MiB output high-water mark.
+
+    assert exchange([b"SET", key, value]) == ("simple", b"OK")
+    payload = encode_command(b"GET", key) * count
+    with connect() as client:
+        client.sendall(payload)
+        reader = RespReader(client)
+        for _ in range(count):
+            assert reader.read() == ("bulk", value)
+    assert exchange([b"DEL", key]) == ("integer", 1)
 
 
 def concurrent_case(index: int) -> None:
-    key = f"parallel-{index}"
-    if request(f"HSET {key} value-{index}") != "SUCCESS":
-        raise AssertionError(f"HSET failed for {key}")
-    if request(f"HGET {key}") != f"value-{index}":
-        raise AssertionError(f"HGET failed for {key}")
-    if request(f"HDEL {key}") != "SUCCESS":
-        raise AssertionError(f"HDEL failed for {key}")
+    key = f"parallel-{index}".encode("ascii")
+    value = f"value-{index}".encode("ascii")
+    with connect() as client:
+        commands = b"".join([
+            encode_command(b"SET", key, value),
+            encode_command(b"GET", key),
+            encode_command(b"DEL", key),
+        ])
+        client.sendall(commands)
+        reader = RespReader(client)
+        assert reader.read() == ("simple", b"OK")
+        assert reader.read() == ("bulk", value)
+        assert reader.read() == ("integer", 1)
 
 
-def run_tests() -> None:
-    assert request("SET integration value") == "SUCCESS"
-    assert request("GET integration") == "value"
-    assert request("GET") == "ERROR wrong number of arguments"
-    assert request("UNKNOWN") == "ERROR unknown command"
-    assert request("GET integration", half_close=True) == "value"
-
+def test_concurrency() -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
         list(executor.map(concurrent_case, range(200)))
 
-    for _ in range(500):
-        assert request("HCOUNT").isdigit()
 
-    client = socket.create_connection((HOST, PORT), timeout=2.0)
-    client.sendall(b"SET abandoned")
-    client.close()
+def test_protocol_failures() -> None:
+    expect_protocol_error(b"PING\r\n")
+    expect_protocol_error(b"*1\r\n$-1\r\n")
+    expect_protocol_error(b"*1\r\n$65537\r\n")
+    expect_protocol_error(b"*1\r\n$4\r\nPI", half_close=True)
+
+
+def run_tests() -> None:
+    test_basic_and_binary()
+    test_fragmentation_and_pipeline()
+    test_large_pipeline_backpressure()
+    test_concurrency()
+    test_protocol_failures()
 
 
 def main() -> int:
     server_command = shlex.split(
-        os.environ.get("KVSTORE_SERVER_COMMAND", "./kvstore")
+        os.environ.get("KVSTORE_SERVER_COMMAND", "./kvstore --engine hash")
     )
     process = subprocess.Popen(
         server_command,
@@ -77,8 +225,8 @@ def main() -> int:
     try:
         wait_for_server(process)
         run_tests()
-        print("reactor_integration: PASS")
-    except BaseException as error:  # Preserve the original test failure after cleanup.
+        print(f"reactor_integration ({' '.join(server_command)}): PASS")
+    except BaseException as error:
         test_error = error
     finally:
         if process.poll() is None:
