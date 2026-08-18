@@ -16,6 +16,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 #define REACTOR_MAX_EVENTS 256
@@ -28,6 +29,7 @@
 enum reactor_source_kind {
     REACTOR_SOURCE_LISTENER,
     REACTOR_SOURCE_WAKE,
+    REACTOR_SOURCE_TIMER,
     REACTOR_SOURCE_CLIENT
 };
 
@@ -54,6 +56,9 @@ struct reactor {
     void *handler_context;
     reactor_connection_t *listener;
     reactor_connection_t *wake_source;
+    reactor_connection_t *timer_source;
+    reactor_periodic_handler periodic_handler;
+    void *periodic_context;
     reactor_connection_t *clients;
 };
 
@@ -398,6 +403,22 @@ static void drain_wake_fd(reactor_t *reactor)
     }
 }
 
+static int drain_timer_fd(reactor_t *reactor)
+{
+    uint64_t expirations;
+    ssize_t result;
+
+    do {
+        result = read(reactor->timer_source->fd,
+                      &expirations,
+                      sizeof(expirations));
+    } while (result < 0 && errno == EINTR);
+    if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        return -1;
+    }
+    return reactor->periodic_handler(reactor->periodic_context);
+}
+
 int reactor_init(reactor_t **out_reactor,
                  uint16_t port,
                  reactor_request_handler handler,
@@ -492,6 +513,13 @@ int reactor_run(reactor_t *reactor)
                 drain_wake_fd(reactor);
                 continue;
             }
+            if (source->kind == REACTOR_SOURCE_TIMER) {
+                if ((active & (EPOLLERR | EPOLLHUP)) != 0 ||
+                    drain_timer_fd(reactor) != 0) {
+                    return -1;
+                }
+                continue;
+            }
             if (source->kind == REACTOR_SOURCE_LISTENER) {
                 if ((active & (EPOLLERR | EPOLLHUP)) != 0) {
                     errno = EIO;
@@ -524,6 +552,48 @@ int reactor_run(reactor_t *reactor)
     return 0;
 }
 
+int reactor_set_periodic(reactor_t *reactor,
+                         uint64_t interval_ms,
+                         reactor_periodic_handler handler,
+                         void *handler_context)
+{
+    struct itimerspec schedule;
+    reactor_connection_t *source;
+    int timer_fd;
+
+    if (reactor == NULL || interval_ms == 0 || handler == NULL ||
+        reactor->timer_source != NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (timer_fd < 0) {
+        return -1;
+    }
+    memset(&schedule, 0, sizeof(schedule));
+    schedule.it_value.tv_sec = (time_t)(interval_ms / 1000U);
+    schedule.it_value.tv_nsec = (long)((interval_ms % 1000U) * 1000000U);
+    schedule.it_interval = schedule.it_value;
+    if (timerfd_settime(timer_fd, 0, &schedule, NULL) != 0) {
+        close(timer_fd);
+        return -1;
+    }
+    source = source_create(reactor, REACTOR_SOURCE_TIMER, timer_fd);
+    if (source == NULL || reactor_add(reactor, timer_fd, EPOLLIN, source) != 0) {
+        if (source == NULL) {
+            close(timer_fd);
+        } else {
+            connection_destroy(source);
+        }
+        return -1;
+    }
+    source->events = EPOLLIN;
+    reactor->timer_source = source;
+    reactor->periodic_handler = handler;
+    reactor->periodic_context = handler_context;
+    return 0;
+}
+
 void reactor_stop(reactor_t *reactor)
 {
     uint64_t value = 1;
@@ -550,6 +620,8 @@ void reactor_destroy(reactor_t *reactor)
     reactor->listener = NULL;
     connection_destroy(reactor->wake_source);
     reactor->wake_source = NULL;
+    connection_destroy(reactor->timer_source);
+    reactor->timer_source = NULL;
     if (reactor->epoll_fd >= 0) {
         close(reactor->epoll_fd);
         reactor->epoll_fd = -1;

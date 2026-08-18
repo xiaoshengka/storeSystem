@@ -4,14 +4,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef enum kvstore_backend {
-    KVSTORE_BACKEND_HASH = 0,
-    KVSTORE_BACKEND_RBTREE = 1
-} kvstore_backend_t;
+#include "cache/cache.h"
 
 typedef struct kvstore_service {
-    kvstore_backend_t backend;
+    cache_t *cache;
     int initialized;
+    unsigned char info_buffer[1024];
 } kvstore_service_t;
 
 typedef struct kvstore_argument {
@@ -34,10 +32,10 @@ typedef struct kvstore_reply {
     int64_t integer;
 } kvstore_reply_t;
 
-const char *kvstore_backend_name(kvstore_backend_t backend);
-int kvstore_backend_parse(const char *name, kvstore_backend_t *backend);
-int kvstore_service_init(kvstore_service_t *service, kvstore_backend_t backend);
+int kvstore_service_init(kvstore_service_t *service,
+                         const cache_config_t *cache_config);
 void kvstore_service_destroy(kvstore_service_t *service);
+int kvstore_service_maintain(kvstore_service_t *service);
 int kvstore_service_execute(kvstore_service_t *service,
                             const kvstore_argument_t *arguments,
                             size_t argument_count,

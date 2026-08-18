@@ -130,6 +130,18 @@ def test_basic_and_binary() -> None:
     assert exchange([b"GET"]) == ("error", b"ERR wrong number of arguments")
     assert exchange([b"HGET", b"key"]) == ("error", b"ERR unknown command")
     assert exchange([b"PING"], half_close=True) == ("simple", b"PONG")
+    assert exchange([b"SET", b"ttl-key", b"ttl-value", b"PX", b"500"]) == (
+        "simple", b"OK"
+    )
+    ttl = exchange([b"PTTL", b"ttl-key"])
+    assert ttl[0] == "integer" and isinstance(ttl[1], int)
+    assert 0 <= ttl[1] <= 500
+    assert exchange([b"PERSIST", b"ttl-key"]) == ("integer", 1)
+    assert exchange([b"TTL", b"ttl-key"]) == ("integer", -1)
+    assert exchange([b"DEL", b"ttl-key"]) == ("integer", 1)
+    info = exchange([b"INFO", b"CACHE"])
+    assert info[0] == "bulk" and isinstance(info[1], bytes)
+    assert b"hits:" in info[1] and b"evicted_keys:" in info[1]
 
 
 def test_fragmentation_and_pipeline() -> None:
@@ -213,7 +225,7 @@ def run_tests() -> None:
 
 def main() -> int:
     server_command = shlex.split(
-        os.environ.get("KVSTORE_SERVER_COMMAND", "./kvstore --engine hash")
+        os.environ.get("KVSTORE_SERVER_COMMAND", "./kvstore")
     )
     process = subprocess.Popen(
         server_command,
