@@ -2,9 +2,9 @@
 
 基于 Linux C、非阻塞 Socket 与单线程 epoll Reactor 的内存 KV 缓存服务。
 
-当前发布版本为 `v0.3.0`。仓库正在开发 `v0.4.0-dev`：epoll 主服务已统一使用
-动态 Hash，并加入 TTL、主动/惰性过期、精确 LRU、容量淘汰和缓存统计。NtyCo、
-Array 与 RBTree 仅作为历史或算法对照保留。
+当前发布版本为 `v0.4.0`：epoll 主服务已统一使用动态 Hash，并加入 TTL、
+主动/惰性过期、精确 LRU、容量淘汰和缓存统计。NtyCo、Array 与 RBTree 仅作为
+历史或算法对照保留。
 
 ## 架构
 
@@ -145,12 +145,13 @@ TTL，`0` 表示永久；`-S` 可复现实验随机序列，`-C` 保留测试键
 `INFO CACHE` 快照和清理均不计入 QPS。客户端报告 GET hit/miss，并通过计时前后
 快照报告服务端 `expired_keys`、`evicted_keys`、内存和 Hash 状态增量。
 
-当前没有 v0.4 正式性能结论。性能报告必须记录 Ubuntu/GCC/编译选项、CPU/内存、
-客户端与服务端位置、容量配置、并发数、Pipeline 深度、请求规模和持续时间。
+v0.4 的阶段性能基线及解释记录在发布说明中；当前尚无延迟分位数或多轮中位数，
+不得将单轮QPS作为生产或跨项目结论。性能报告必须记录Ubuntu/GCC/编译选项、
+CPU/内存、客户端与服务端位置、容量配置、并发数、Pipeline深度、请求规模和持续时间。
 
 ## 当前限制
 
-- `v0.4.0-dev` 尚未发布；AOF、MySQL Cache-Aside、配置文件、集群和复制尚未实现。
+- AOF、MySQL Cache-Aside、配置文件、集群和复制尚未实现。
 - Hash 只扩容、不缩容；当前仍使用已有的非加盐字节哈希函数。
 - LRU 是精确实现，不是 Redis 的抽样近似算法；TTL 不支持成员级过期。
 - RBTree 不再是 epoll 服务后端，计划在 v0.7 与 Skip List 一起用于有序集合模块。

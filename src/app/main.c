@@ -278,7 +278,7 @@ int main(int argc, char **argv)
     }
 
     active_reactor = reactor;
-    printf("storeSystem v0.4.0-dev RESP reactor listening on port %u "
+    printf("storeSystem v0.4.0 RESP reactor listening on port %u "
            "(engine=hash, maxmemory=%zu, maxkeys=%zu)\n",
            DEFAULT_PORT,
            cache_config.max_memory,
