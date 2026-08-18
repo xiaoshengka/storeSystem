@@ -12,6 +12,7 @@
 
 #ifndef NETWORK_BACKEND_NTYCO
 #define DEFAULT_PORT 9096U
+#define CACHE_MAINTENANCE_INTERVAL_MS 100U
 
 static reactor_t *active_reactor;
 
@@ -134,44 +135,127 @@ static int dispatch_request(const unsigned char *input,
     return REACTOR_HANDLER_COMPLETE;
 }
 
-static void print_usage(const char *program)
+static int maintain_cache(void *context)
 {
-    fprintf(stderr, "Usage: %s [--engine hash|rbtree]\n", program);
+    return kvstore_service_maintain(context);
 }
 
-static int parse_backend(int argc, char **argv, kvstore_backend_t *backend)
+static int suffix_equals(const char *value, const char *expected)
 {
-    *backend = KVSTORE_BACKEND_HASH;
-    if (argc == 1) {
-        return 0;
+    while (*value != '\0' && *expected != '\0') {
+        unsigned char left = (unsigned char)*value;
+        unsigned char right = (unsigned char)*expected;
+
+        if (left >= 'A' && left <= 'Z') {
+            left = (unsigned char)(left - 'A' + 'a');
+        }
+        if (left != right) {
+            return 0;
+        }
+        value++;
+        expected++;
     }
+    return *value == '\0' && *expected == '\0';
+}
+
+static int parse_size(const char *text, int allow_units, size_t *result)
+{
+    size_t value = 0;
+    size_t index = 0;
+    size_t multiplier = 1U;
+
+    if (text == NULL || result == NULL || text[0] < '0' || text[0] > '9') {
+        return -1;
+    }
+    while (text[index] >= '0' && text[index] <= '9') {
+        unsigned int digit = (unsigned int)(text[index] - '0');
+
+        if (value > (SIZE_MAX - digit) / 10U) {
+            return -1;
+        }
+        value = value * 10U + digit;
+        index++;
+    }
+    if (text[index] != '\0') {
+        if (!allow_units) {
+            return -1;
+        }
+        if (suffix_equals(text + index, "kib")) {
+            multiplier = 1024U;
+        } else if (suffix_equals(text + index, "mib")) {
+            multiplier = 1024U * 1024U;
+        } else if (suffix_equals(text + index, "gib")) {
+            multiplier = 1024U * 1024U * 1024U;
+        } else {
+            return -1;
+        }
+    }
+    if (value > SIZE_MAX / multiplier) {
+        return -1;
+    }
+    *result = value * multiplier;
+    return 0;
+}
+
+static void print_usage(const char *program)
+{
+    fprintf(stderr,
+            "Usage: %s [--maxmemory SIZE] [--maxkeys COUNT]\n"
+            "  SIZE accepts bytes or KiB/MiB/GiB suffixes; 0 means unlimited.\n"
+            "  COUNT is an unsigned decimal integer; 0 means unlimited.\n",
+            program);
+}
+
+static int parse_options(int argc, char **argv, cache_config_t *config)
+{
+    int saw_maxmemory = 0;
+    int saw_maxkeys = 0;
+    int index;
+
+    memset(config, 0, sizeof(*config));
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
         print_usage(argv[0]);
         return 1;
     }
-    if (argc == 3 && strcmp(argv[1], "--engine") == 0 &&
-        kvstore_backend_parse(argv[2], backend) == 0) {
-        return 0;
+    for (index = 1; index < argc; index += 2) {
+        if (index + 1 >= argc) {
+            print_usage(argv[0]);
+            return -1;
+        }
+        if (strcmp(argv[index], "--maxmemory") == 0 && !saw_maxmemory) {
+            if (parse_size(argv[index + 1], 1, &config->max_memory) != 0) {
+                print_usage(argv[0]);
+                return -1;
+            }
+            saw_maxmemory = 1;
+        } else if (strcmp(argv[index], "--maxkeys") == 0 && !saw_maxkeys) {
+            if (parse_size(argv[index + 1], 0, &config->max_keys) != 0) {
+                print_usage(argv[0]);
+                return -1;
+            }
+            saw_maxkeys = 1;
+        } else {
+            print_usage(argv[0]);
+            return -1;
+        }
     }
-    print_usage(argv[0]);
-    return -1;
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
-    kvstore_backend_t backend;
+    cache_config_t cache_config;
     kvstore_service_t service;
     reactor_t *reactor = NULL;
     int parse_result;
     int result = 1;
 
-    parse_result = parse_backend(argc, argv, &backend);
+    parse_result = parse_options(argc, argv, &cache_config);
     if (parse_result != 0) {
         return parse_result > 0 ? 0 : 2;
     }
-    if (kvstore_service_init(&service, backend) != 0) {
-        fprintf(stderr, "failed to initialize %s KV engine\n",
-                kvstore_backend_name(backend));
+    if (kvstore_service_init(&service, &cache_config) != 0) {
+        fprintf(stderr, "failed to initialize Hash cache\n");
         return 1;
     }
     if (install_signal_handlers() != 0) {
@@ -185,11 +269,20 @@ int main(int argc, char **argv)
         perror("reactor_init");
         goto cleanup_service;
     }
+    if (reactor_set_periodic(reactor,
+                             CACHE_MAINTENANCE_INTERVAL_MS,
+                             maintain_cache,
+                             &service) != 0) {
+        perror("reactor_set_periodic");
+        goto cleanup_reactor;
+    }
 
     active_reactor = reactor;
-    printf("storeSystem v0.3.0-dev RESP reactor listening on port %u (engine=%s)\n",
+    printf("storeSystem v0.4.0 RESP reactor listening on port %u "
+           "(engine=hash, maxmemory=%zu, maxkeys=%zu)\n",
            DEFAULT_PORT,
-           kvstore_backend_name(backend));
+           cache_config.max_memory,
+           cache_config.max_keys);
     if (reactor_run(reactor) != 0 && errno != EINTR) {
         perror("reactor_run");
         goto cleanup_reactor;

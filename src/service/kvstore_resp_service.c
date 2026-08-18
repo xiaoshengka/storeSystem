@@ -1,7 +1,8 @@
 #include "service/kvstore_service.h"
 
-#include "kvstore.h"
-
+#include <inttypes.h>
+#include <limits.h>
+#include <stdio.h>
 #include <string.h>
 
 static const unsigned char reply_ok[] = "OK";
@@ -9,12 +10,23 @@ static const unsigned char reply_pong[] = "PONG";
 static const unsigned char error_unknown[] = "ERR unknown command";
 static const unsigned char error_arity[] = "ERR wrong number of arguments";
 static const unsigned char error_internal[] = "ERR internal error";
+static const unsigned char error_syntax[] = "ERR syntax error";
+static const unsigned char error_integer[] =
+    "ERR value is not an integer or out of range";
+static const unsigned char error_expire[] = "ERR invalid expire time in SET";
+static const unsigned char error_capacity[] = "ERR cache capacity exceeded";
 
 enum service_command {
     SERVICE_COMMAND_SET,
     SERVICE_COMMAND_GET,
     SERVICE_COMMAND_DEL,
     SERVICE_COMMAND_PING,
+    SERVICE_COMMAND_EXPIRE,
+    SERVICE_COMMAND_PEXPIRE,
+    SERVICE_COMMAND_TTL,
+    SERVICE_COMMAND_PTTL,
+    SERVICE_COMMAND_PERSIST,
+    SERVICE_COMMAND_INFO,
     SERVICE_COMMAND_UNKNOWN
 };
 
@@ -26,7 +38,7 @@ static unsigned char ascii_upper(unsigned char value)
     return value;
 }
 
-static int command_equals(const kvstore_argument_t *argument, const char *name)
+static int argument_equals(const kvstore_argument_t *argument, const char *name)
 {
     size_t length = strlen(name);
     size_t index;
@@ -44,10 +56,16 @@ static int command_equals(const kvstore_argument_t *argument, const char *name)
 
 static enum service_command find_command(const kvstore_argument_t *argument)
 {
-    if (command_equals(argument, "SET")) return SERVICE_COMMAND_SET;
-    if (command_equals(argument, "GET")) return SERVICE_COMMAND_GET;
-    if (command_equals(argument, "DEL")) return SERVICE_COMMAND_DEL;
-    if (command_equals(argument, "PING")) return SERVICE_COMMAND_PING;
+    if (argument_equals(argument, "SET")) return SERVICE_COMMAND_SET;
+    if (argument_equals(argument, "GET")) return SERVICE_COMMAND_GET;
+    if (argument_equals(argument, "DEL")) return SERVICE_COMMAND_DEL;
+    if (argument_equals(argument, "PING")) return SERVICE_COMMAND_PING;
+    if (argument_equals(argument, "EXPIRE")) return SERVICE_COMMAND_EXPIRE;
+    if (argument_equals(argument, "PEXPIRE")) return SERVICE_COMMAND_PEXPIRE;
+    if (argument_equals(argument, "TTL")) return SERVICE_COMMAND_TTL;
+    if (argument_equals(argument, "PTTL")) return SERVICE_COMMAND_PTTL;
+    if (argument_equals(argument, "PERSIST")) return SERVICE_COMMAND_PERSIST;
+    if (argument_equals(argument, "INFO")) return SERVICE_COMMAND_INFO;
     return SERVICE_COMMAND_UNKNOWN;
 }
 
@@ -69,56 +87,86 @@ static void set_error(kvstore_reply_t *reply,
     set_data_reply(reply, KVSTORE_REPLY_ERROR, message, length);
 }
 
-const char *kvstore_backend_name(kvstore_backend_t backend)
+static void set_integer(kvstore_reply_t *reply, int64_t value)
 {
-    switch (backend) {
-    case KVSTORE_BACKEND_HASH:
-        return "hash";
-    case KVSTORE_BACKEND_RBTREE:
-        return "rbtree";
-    default:
-        return "unknown";
-    }
+    reply->type = KVSTORE_REPLY_INTEGER;
+    reply->data = NULL;
+    reply->length = 0;
+    reply->integer = value;
 }
 
-int kvstore_backend_parse(const char *name, kvstore_backend_t *backend)
+static int parse_int64(const kvstore_argument_t *argument, int64_t *result)
 {
-    if (name == NULL || backend == NULL) {
+    uint64_t magnitude = 0;
+    uint64_t limit;
+    size_t index = 0;
+    int negative = 0;
+
+    if (argument == NULL || result == NULL || argument->length == 0) {
         return -1;
     }
-    if (strcmp(name, "hash") == 0) {
-        *backend = KVSTORE_BACKEND_HASH;
-        return 0;
+    if (argument->data[index] == '-') {
+        negative = 1;
+        index++;
+        if (index == argument->length) {
+            return -1;
+        }
     }
-    if (strcmp(name, "rbtree") == 0) {
-        *backend = KVSTORE_BACKEND_RBTREE;
-        return 0;
+    limit = negative ? (uint64_t)INT64_MAX + 1U : (uint64_t)INT64_MAX;
+    for (; index < argument->length; ++index) {
+        unsigned int digit;
+
+        if (argument->data[index] < '0' || argument->data[index] > '9') {
+            return -1;
+        }
+        digit = (unsigned int)(argument->data[index] - '0');
+        if (magnitude > (limit - digit) / 10U) {
+            return -1;
+        }
+        magnitude = magnitude * 10U + digit;
     }
-    return -1;
+    if (negative) {
+        *result = magnitude == (uint64_t)INT64_MAX + 1U
+                      ? INT64_MIN
+                      : -(int64_t)magnitude;
+    } else {
+        *result = (int64_t)magnitude;
+    }
+    return 0;
 }
 
-int kvstore_service_init(kvstore_service_t *service, kvstore_backend_t backend)
+static int duration_ms(const kvstore_argument_t *argument,
+                       uint64_t multiplier,
+                       int require_positive,
+                       int64_t *parsed,
+                       uint64_t *milliseconds)
 {
-    int result;
+    int64_t value;
 
+    if (parse_int64(argument, &value) != 0) {
+        return -1;
+    }
+    *parsed = value;
+    if (value <= 0) {
+        return require_positive ? -2 : 0;
+    }
+    if ((uint64_t)value > UINT64_MAX / multiplier) {
+        return -1;
+    }
+    *milliseconds = (uint64_t)value * multiplier;
+    return 0;
+}
+
+int kvstore_service_init(kvstore_service_t *service,
+                         const cache_config_t *cache_config)
+{
     if (service == NULL) {
         return -1;
     }
     memset(service, 0, sizeof(*service));
-    switch (backend) {
-    case KVSTORE_BACKEND_HASH:
-        result = kvstore_hash_create(&Hash);
-        break;
-    case KVSTORE_BACKEND_RBTREE:
-        result = kvstore_rbtree_create(&Tree);
-        break;
-    default:
+    if (cache_create(&service->cache, cache_config) != 0) {
         return -1;
     }
-    if (result != 0) {
-        return -1;
-    }
-    service->backend = backend;
     service->initialized = 1;
     return 0;
 }
@@ -128,49 +176,160 @@ void kvstore_service_destroy(kvstore_service_t *service)
     if (service == NULL || !service->initialized) {
         return;
     }
-    if (service->backend == KVSTORE_BACKEND_HASH) {
-        kvstore_hash_destory(&Hash);
-    } else if (service->backend == KVSTORE_BACKEND_RBTREE) {
-        kvstore_rbtree_destory(&Tree);
-    }
+    cache_destroy(service->cache);
     memset(service, 0, sizeof(*service));
 }
 
-static int backend_set(kvstore_service_t *service,
-                       const kvstore_argument_t *key,
-                       const kvstore_argument_t *value)
+int kvstore_service_maintain(kvstore_service_t *service)
 {
-    if (service->backend == KVSTORE_BACKEND_HASH) {
-        return kvs_hash_upsert_bytes(&Hash,
-                                     key->data,
-                                     key->length,
-                                     value->data,
-                                     value->length);
+    if (service == NULL || !service->initialized) {
+        return -1;
     }
-    return kvs_rbtree_upsert_bytes(&Tree,
-                                   key->data,
-                                   key->length,
-                                   value->data,
-                                   value->length);
+    (void)cache_maintain(service->cache, 64U, 16U);
+    return 0;
 }
 
-static const void *backend_get(kvstore_service_t *service,
-                               const kvstore_argument_t *key,
-                               size_t *value_length)
+static int execute_set(kvstore_service_t *service,
+                       const kvstore_argument_t *arguments,
+                       size_t argument_count,
+                       kvstore_reply_t *reply)
 {
-    if (service->backend == KVSTORE_BACKEND_HASH) {
-        return kvs_hash_get_bytes(&Hash, key->data, key->length, value_length);
+    uint64_t ttl_ms = 0;
+    int result;
+
+    if (argument_count == 5U) {
+        uint64_t multiplier;
+        int64_t parsed;
+        int parse_result;
+
+        if (argument_equals(&arguments[3], "EX")) {
+            multiplier = 1000U;
+        } else if (argument_equals(&arguments[3], "PX")) {
+            multiplier = 1U;
+        } else {
+            set_error(reply, error_syntax, sizeof(error_syntax) - 1U);
+            return 0;
+        }
+        parse_result = duration_ms(&arguments[4],
+                                   multiplier,
+                                   1,
+                                   &parsed,
+                                   &ttl_ms);
+        if (parse_result == -2) {
+            set_error(reply, error_expire, sizeof(error_expire) - 1U);
+            return 0;
+        }
+        if (parse_result != 0) {
+            set_error(reply, error_integer, sizeof(error_integer) - 1U);
+            return 0;
+        }
     }
-    return kvs_rbtree_get_bytes(&Tree, key->data, key->length, value_length);
+    result = cache_set(service->cache,
+                       arguments[1].data,
+                       arguments[1].length,
+                       arguments[2].data,
+                       arguments[2].length,
+                       ttl_ms);
+    if (result == CACHE_SET_CAPACITY) {
+        set_error(reply, error_capacity, sizeof(error_capacity) - 1U);
+    } else if (result == CACHE_SET_RANGE) {
+        set_error(reply, error_integer, sizeof(error_integer) - 1U);
+    } else if (result != CACHE_SET_OK) {
+        set_error(reply, error_internal, sizeof(error_internal) - 1U);
+    } else {
+        set_data_reply(reply,
+                       KVSTORE_REPLY_SIMPLE,
+                       reply_ok,
+                       sizeof(reply_ok) - 1U);
+    }
+    return 0;
 }
 
-static int backend_delete(kvstore_service_t *service,
-                          const kvstore_argument_t *key)
+static int execute_expire(kvstore_service_t *service,
+                          const kvstore_argument_t *arguments,
+                          uint64_t multiplier,
+                          kvstore_reply_t *reply)
 {
-    if (service->backend == KVSTORE_BACKEND_HASH) {
-        return kvs_hash_delete_bytes(&Hash, key->data, key->length);
+    int64_t parsed;
+    uint64_t ttl_ms = 0;
+    int parse_result;
+    int result;
+
+    parse_result = duration_ms(&arguments[2],
+                               multiplier,
+                               0,
+                               &parsed,
+                               &ttl_ms);
+    if (parse_result != 0) {
+        set_error(reply, error_integer, sizeof(error_integer) - 1U);
+        return 0;
     }
-    return kvs_rbtree_delete_bytes(&Tree, key->data, key->length);
+    if (parsed <= 0) {
+        result = cache_delete(service->cache,
+                              arguments[1].data,
+                              arguments[1].length);
+    } else {
+        result = cache_expire(service->cache,
+                              arguments[1].data,
+                              arguments[1].length,
+                              ttl_ms);
+    }
+    if (result == -2) {
+        set_error(reply, error_integer, sizeof(error_integer) - 1U);
+    } else if (result < 0) {
+        set_error(reply, error_internal, sizeof(error_internal) - 1U);
+    } else {
+        set_integer(reply, result);
+    }
+    return 0;
+}
+
+static int execute_info(kvstore_service_t *service, kvstore_reply_t *reply)
+{
+    cache_stats_t stats;
+    uint64_t requests;
+    double hit_rate;
+    int written;
+
+    cache_get_stats(service->cache, &stats);
+    requests = stats.hits + stats.misses;
+    hit_rate = requests == 0 ? 0.0
+                             : (double)stats.hits * 100.0 / (double)requests;
+    written = snprintf((char *)service->info_buffer,
+                       sizeof(service->info_buffer),
+                       "keys:%zu\r\n"
+                       "used_memory:%zu\r\n"
+                       "index_memory:%zu\r\n"
+                       "maxmemory:%zu\r\n"
+                       "maxkeys:%zu\r\n"
+                       "hits:%" PRIu64 "\r\n"
+                       "misses:%" PRIu64 "\r\n"
+                       "hit_rate:%.2f%%\r\n"
+                       "expired_keys:%" PRIu64 "\r\n"
+                       "evicted_keys:%" PRIu64 "\r\n"
+                       "hash_slots:%zu\r\n"
+                       "rehashing:%d\r\n",
+                       stats.keys,
+                       stats.used_memory,
+                       stats.index_memory,
+                       stats.max_memory,
+                       stats.max_keys,
+                       stats.hits,
+                       stats.misses,
+                       hit_rate,
+                       stats.expired_keys,
+                       stats.evicted_keys,
+                       stats.hash_slots,
+                       stats.rehashing);
+    if (written < 0 || (size_t)written >= sizeof(service->info_buffer)) {
+        set_error(reply, error_internal, sizeof(error_internal) - 1U);
+    } else {
+        set_data_reply(reply,
+                       KVSTORE_REPLY_BULK,
+                       service->info_buffer,
+                       (size_t)written);
+    }
+    return 0;
 }
 
 int kvstore_service_execute(kvstore_service_t *service,
@@ -191,56 +350,99 @@ int kvstore_service_execute(kvstore_service_t *service,
         return 0;
     }
 
-    if ((command == SERVICE_COMMAND_SET && argument_count != 3U) ||
-        ((command == SERVICE_COMMAND_GET || command == SERVICE_COMMAND_DEL) &&
+    if ((command == SERVICE_COMMAND_SET &&
+         argument_count != 3U && argument_count != 5U) ||
+        ((command == SERVICE_COMMAND_GET || command == SERVICE_COMMAND_DEL ||
+          command == SERVICE_COMMAND_TTL || command == SERVICE_COMMAND_PTTL ||
+          command == SERVICE_COMMAND_PERSIST) &&
          argument_count != 2U) ||
+        ((command == SERVICE_COMMAND_EXPIRE ||
+          command == SERVICE_COMMAND_PEXPIRE) &&
+         argument_count != 3U) ||
         (command == SERVICE_COMMAND_PING &&
-         argument_count != 1U && argument_count != 2U)) {
+         argument_count != 1U && argument_count != 2U) ||
+        (command == SERVICE_COMMAND_INFO && argument_count != 2U)) {
         set_error(reply, error_arity, sizeof(error_arity) - 1U);
         return 0;
     }
 
     switch (command) {
     case SERVICE_COMMAND_SET:
-        if (backend_set(service, &arguments[1], &arguments[2]) != 0) {
-            set_error(reply, error_internal, sizeof(error_internal) - 1U);
-        } else {
-            set_data_reply(reply,
-                           KVSTORE_REPLY_SIMPLE,
-                           reply_ok,
-                           sizeof(reply_ok) - 1U);
-        }
-        return 0;
+        return execute_set(service, arguments, argument_count, reply);
     case SERVICE_COMMAND_GET:
-        reply->data = backend_get(service, &arguments[1], &reply->length);
+        reply->data = cache_get(service->cache,
+                                arguments[1].data,
+                                arguments[1].length,
+                                &reply->length);
         reply->type = reply->data != NULL ? KVSTORE_REPLY_BULK
                                           : KVSTORE_REPLY_NULL_BULK;
         return 0;
     case SERVICE_COMMAND_DEL:
         {
-            int deleted = backend_delete(service, &arguments[1]);
+            int deleted = cache_delete(service->cache,
+                                       arguments[1].data,
+                                       arguments[1].length);
 
             if (deleted < 0) {
                 set_error(reply, error_internal, sizeof(error_internal) - 1U);
             } else {
-                reply->type = KVSTORE_REPLY_INTEGER;
-                reply->integer = deleted;
+                set_integer(reply, deleted);
             }
         }
         return 0;
     case SERVICE_COMMAND_PING:
-        if (argument_count == 1U) {
-            set_data_reply(reply,
-                           KVSTORE_REPLY_SIMPLE,
-                           reply_pong,
-                           sizeof(reply_pong) - 1U);
-        } else {
+        if (argument_count == 2U) {
             set_data_reply(reply,
                            KVSTORE_REPLY_BULK,
                            arguments[1].data,
                            arguments[1].length);
+        } else {
+            set_data_reply(reply,
+                           KVSTORE_REPLY_SIMPLE,
+                           reply_pong,
+                           sizeof(reply_pong) - 1U);
         }
         return 0;
+    case SERVICE_COMMAND_EXPIRE:
+        return execute_expire(service, arguments, 1000U, reply);
+    case SERVICE_COMMAND_PEXPIRE:
+        return execute_expire(service, arguments, 1U, reply);
+    case SERVICE_COMMAND_TTL:
+    case SERVICE_COMMAND_PTTL:
+        {
+            int64_t ttl_ms;
+
+            if (cache_ttl_ms(service->cache,
+                             arguments[1].data,
+                             arguments[1].length,
+                             &ttl_ms) != 0) {
+                set_error(reply, error_internal, sizeof(error_internal) - 1U);
+            } else if (command == SERVICE_COMMAND_TTL && ttl_ms >= 0) {
+                set_integer(reply, ttl_ms / 1000);
+            } else {
+                set_integer(reply, ttl_ms);
+            }
+        }
+        return 0;
+    case SERVICE_COMMAND_PERSIST:
+        {
+            int persisted = cache_persist(service->cache,
+                                          arguments[1].data,
+                                          arguments[1].length);
+
+            if (persisted < 0) {
+                set_error(reply, error_internal, sizeof(error_internal) - 1U);
+            } else {
+                set_integer(reply, persisted);
+            }
+        }
+        return 0;
+    case SERVICE_COMMAND_INFO:
+        if (!argument_equals(&arguments[1], "CACHE")) {
+            set_error(reply, error_syntax, sizeof(error_syntax) - 1U);
+            return 0;
+        }
+        return execute_info(service, reply);
     default:
         return -1;
     }

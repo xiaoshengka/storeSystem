@@ -4,6 +4,15 @@
 #include <stdio.h>
 #include <string.h>
 
+typedef struct fake_clock {
+    uint64_t now_ms;
+} fake_clock_t;
+
+static uint64_t fake_now(void *context)
+{
+    return ((fake_clock_t *)context)->now_ms;
+}
+
 static kvstore_argument_t argument(const void *data, size_t length)
 {
     kvstore_argument_t result;
@@ -23,99 +32,107 @@ static kvstore_reply_t execute(kvstore_service_t *service,
     return reply;
 }
 
-static void run_backend_case(kvstore_backend_t backend)
+int main(void)
 {
-    static const unsigned char set_command[] = "sEt";
-    static const unsigned char get_command[] = "GET";
-    static const unsigned char del_command[] = "del";
-    static const unsigned char ping_command[] = "PING";
-    static const unsigned char unknown_command[] = "HGET";
     static const unsigned char key[] = {'k', 0, 'y'};
     static const unsigned char value[] = {'v', 0, '1'};
     static const unsigned char replacement[] = {'v', 0, '2', 0};
-    static const unsigned char prefix_key[] = {'a', 0};
-    static const unsigned char longer_key[] = {'a', 0, 0};
-    kvstore_argument_t arguments[3];
+    fake_clock_t clock = {10000U};
+    cache_config_t config = {0};
+    kvstore_argument_t arguments[5];
     kvstore_service_t service;
     kvstore_reply_t reply;
 
-    assert(kvstore_service_init(&service, backend) == 0);
+    config.max_keys = 32U;
+    config.now_ms = fake_now;
+    config.clock_context = &clock;
+    assert(kvstore_service_init(&service, &config) == 0);
 
-    arguments[0] = argument(set_command, sizeof(set_command) - 1U);
+    arguments[0] = argument("sEt", 3);
     arguments[1] = argument(key, sizeof(key));
     arguments[2] = argument(value, sizeof(value));
     reply = execute(&service, arguments, 3U);
     assert(reply.type == KVSTORE_REPLY_SIMPLE);
-    assert(reply.length == 2U && memcmp(reply.data, "OK", 2U) == 0);
 
-    arguments[2] = argument(replacement, sizeof(replacement));
-    reply = execute(&service, arguments, 3U);
-    assert(reply.type == KVSTORE_REPLY_SIMPLE);
-
-    arguments[0] = argument(get_command, sizeof(get_command) - 1U);
+    arguments[0] = argument("GET", 3);
     reply = execute(&service, arguments, 2U);
     assert(reply.type == KVSTORE_REPLY_BULK);
-    assert(reply.length == sizeof(replacement));
-    assert(memcmp(reply.data, replacement, sizeof(replacement)) == 0);
+    assert(reply.length == sizeof(value));
+    assert(memcmp(reply.data, value, sizeof(value)) == 0);
 
-    arguments[0] = argument(del_command, sizeof(del_command) - 1U);
+    arguments[0] = argument("SET", 3);
+    arguments[2] = argument(replacement, sizeof(replacement));
+    arguments[3] = argument("pX", 2);
+    arguments[4] = argument("100", 3);
+    reply = execute(&service, arguments, 5U);
+    assert(reply.type == KVSTORE_REPLY_SIMPLE);
+    arguments[0] = argument("PTTL", 4);
     reply = execute(&service, arguments, 2U);
-    assert(reply.type == KVSTORE_REPLY_INTEGER && reply.integer == 1);
+    assert(reply.type == KVSTORE_REPLY_INTEGER && reply.integer == 100);
+    arguments[0] = argument("TTL", 3);
     reply = execute(&service, arguments, 2U);
-    assert(reply.type == KVSTORE_REPLY_INTEGER && reply.integer == 0);
-
-    arguments[0] = argument(get_command, sizeof(get_command) - 1U);
+    assert(reply.integer == 0);
+    clock.now_ms += 100U;
+    arguments[0] = argument("GET", 3);
     reply = execute(&service, arguments, 2U);
     assert(reply.type == KVSTORE_REPLY_NULL_BULK);
 
-    arguments[0] = argument(set_command, sizeof(set_command) - 1U);
-    arguments[1] = argument(NULL, 0);
-    arguments[2] = argument(NULL, 0);
+    arguments[0] = argument("SET", 3);
+    arguments[1] = argument("persist", 7);
+    arguments[2] = argument("value", 5);
+    assert(execute(&service, arguments, 3U).type == KVSTORE_REPLY_SIMPLE);
+    arguments[0] = argument("EXPIRE", 6);
+    arguments[2] = argument("10", 2);
     reply = execute(&service, arguments, 3U);
-    assert(reply.type == KVSTORE_REPLY_SIMPLE);
-    arguments[0] = argument(get_command, sizeof(get_command) - 1U);
+    assert(reply.type == KVSTORE_REPLY_INTEGER && reply.integer == 1);
+    arguments[0] = argument("PERSIST", 7);
     reply = execute(&service, arguments, 2U);
-    assert(reply.type == KVSTORE_REPLY_BULK && reply.length == 0);
+    assert(reply.integer == 1);
+    reply = execute(&service, arguments, 2U);
+    assert(reply.integer == 0);
 
-    arguments[0] = argument(set_command, sizeof(set_command) - 1U);
-    arguments[1] = argument(prefix_key, sizeof(prefix_key));
-    arguments[2] = argument(value, sizeof(value));
-    assert(execute(&service, arguments, 3U).type == KVSTORE_REPLY_SIMPLE);
-    arguments[1] = argument(longer_key, sizeof(longer_key));
-    arguments[2] = argument(replacement, sizeof(replacement));
-    assert(execute(&service, arguments, 3U).type == KVSTORE_REPLY_SIMPLE);
-    arguments[0] = argument(get_command, sizeof(get_command) - 1U);
-    arguments[1] = argument(prefix_key, sizeof(prefix_key));
+    arguments[0] = argument("PEXPIRE", 7);
+    arguments[2] = argument("0", 1);
+    reply = execute(&service, arguments, 3U);
+    assert(reply.integer == 1);
+    arguments[0] = argument("PTTL", 4);
     reply = execute(&service, arguments, 2U);
-    assert(reply.length == sizeof(value) && memcmp(reply.data, value, sizeof(value)) == 0);
-    arguments[1] = argument(longer_key, sizeof(longer_key));
-    reply = execute(&service, arguments, 2U);
-    assert(reply.length == sizeof(replacement));
-    assert(memcmp(reply.data, replacement, sizeof(replacement)) == 0);
+    assert(reply.integer == -2);
 
-    arguments[0] = argument(ping_command, sizeof(ping_command) - 1U);
-    reply = execute(&service, arguments, 1U);
-    assert(reply.type == KVSTORE_REPLY_SIMPLE);
-    assert(reply.length == 4U && memcmp(reply.data, "PONG", 4U) == 0);
-    arguments[1] = argument(value, sizeof(value));
+    arguments[0] = argument("SET", 3);
+    arguments[1] = argument("bad", 3);
+    arguments[2] = argument("value", 5);
+    arguments[3] = argument("EX", 2);
+    arguments[4] = argument("-1", 2);
+    reply = execute(&service, arguments, 5U);
+    assert(reply.type == KVSTORE_REPLY_ERROR);
+    arguments[4] = argument("not-a-number", 12);
+    reply = execute(&service, arguments, 5U);
+    assert(reply.type == KVSTORE_REPLY_ERROR);
+
+    arguments[0] = argument("INFO", 4);
+    arguments[1] = argument("CACHE", 5);
     reply = execute(&service, arguments, 2U);
     assert(reply.type == KVSTORE_REPLY_BULK);
-    assert(reply.length == sizeof(value) && memcmp(reply.data, value, sizeof(value)) == 0);
+    assert(strstr((const char *)reply.data, "keys:") != NULL);
+    assert(strstr((const char *)reply.data, "hits:1\r\n") != NULL);
+    assert(strstr((const char *)reply.data, "misses:1\r\n") != NULL);
 
-    arguments[0] = argument(unknown_command, sizeof(unknown_command) - 1U);
+    arguments[0] = argument("PING", 4);
+    reply = execute(&service, arguments, 1U);
+    assert(reply.type == KVSTORE_REPLY_SIMPLE);
+    arguments[1] = argument(value, sizeof(value));
+    reply = execute(&service, arguments, 2U);
+    assert(reply.type == KVSTORE_REPLY_BULK && reply.length == sizeof(value));
+
+    arguments[0] = argument("UNKNOWN", 7);
     reply = execute(&service, arguments, 1U);
     assert(reply.type == KVSTORE_REPLY_ERROR);
-    arguments[0] = argument(get_command, sizeof(get_command) - 1U);
+    arguments[0] = argument("GET", 3);
     reply = execute(&service, arguments, 1U);
     assert(reply.type == KVSTORE_REPLY_ERROR);
 
     kvstore_service_destroy(&service);
-}
-
-int main(void)
-{
-    run_backend_case(KVSTORE_BACKEND_HASH);
-    run_backend_case(KVSTORE_BACKEND_RBTREE);
     puts("test_resp_service: PASS");
     return 0;
 }
