@@ -7,6 +7,9 @@
 typedef struct cache cache_t;
 
 typedef uint64_t (*cache_now_ms_fn)(void *context);
+typedef void (*cache_eviction_fn)(const void *key,
+                                  size_t key_length,
+                                  void *context);
 
 typedef struct cache_config {
     size_t max_keys;
@@ -38,6 +41,9 @@ enum cache_set_result {
 
 int cache_create(cache_t **out_cache, const cache_config_t *config);
 void cache_destroy(cache_t *cache);
+void cache_set_eviction_callback(cache_t *cache,
+                                 cache_eviction_fn callback,
+                                 void *context);
 
 int cache_set(cache_t *cache,
               const void *key,
@@ -45,6 +51,12 @@ int cache_set(cache_t *cache,
               const void *value,
               size_t value_length,
               uint64_t ttl_ms);
+int cache_set_expire_at(cache_t *cache,
+                        const void *key,
+                        size_t key_length,
+                        const void *value,
+                        size_t value_length,
+                        uint64_t expire_at_ms);
 const void *cache_get(cache_t *cache,
                       const void *key,
                       size_t key_length,
@@ -54,6 +66,10 @@ int cache_expire(cache_t *cache,
                  const void *key,
                  size_t key_length,
                  uint64_t ttl_ms);
+int cache_expire_at(cache_t *cache,
+                    const void *key,
+                    size_t key_length,
+                    uint64_t expire_at_ms);
 int cache_persist(cache_t *cache, const void *key, size_t key_length);
 int cache_ttl_ms(cache_t *cache,
                  const void *key,
@@ -62,5 +78,6 @@ int cache_ttl_ms(cache_t *cache,
 
 size_t cache_maintain(cache_t *cache, size_t expire_budget, size_t rehash_budget);
 void cache_get_stats(const cache_t *cache, cache_stats_t *stats);
+uint64_t cache_current_time_ms(const cache_t *cache);
 
 #endif

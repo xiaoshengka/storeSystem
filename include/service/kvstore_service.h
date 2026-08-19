@@ -5,9 +5,12 @@
 #include <stdint.h>
 
 #include "cache/cache.h"
+#include "persistence/aof.h"
 
 typedef struct kvstore_service {
     cache_t *cache;
+    aof_t *aof;
+    int aof_flush_failure_reported;
     int initialized;
     unsigned char info_buffer[1024];
 } kvstore_service_t;
@@ -36,6 +39,11 @@ int kvstore_service_init(kvstore_service_t *service,
                          const cache_config_t *cache_config);
 void kvstore_service_destroy(kvstore_service_t *service);
 int kvstore_service_maintain(kvstore_service_t *service);
+int kvstore_service_flush(kvstore_service_t *service);
+void kvstore_service_attach_aof(kvstore_service_t *service, aof_t *aof);
+int kvstore_service_replay_aof(const aof_argument_t *arguments,
+                               size_t argument_count,
+                               void *context);
 int kvstore_service_execute(kvstore_service_t *service,
                             const kvstore_argument_t *arguments,
                             size_t argument_count,

@@ -336,6 +336,16 @@ void kv_hash_node_set_payload(kv_hash_node_t *node, void *payload)
     }
 }
 
+const void *kv_hash_node_key(const kv_hash_node_t *node)
+{
+    return node != NULL ? node->key : NULL;
+}
+
+size_t kv_hash_node_key_length(const kv_hash_node_t *node)
+{
+    return node != NULL ? node->key_length : 0;
+}
+
 size_t kv_hash_count(const hashtable_t *hash)
 {
     return hash != NULL ? hash->count : 0;
