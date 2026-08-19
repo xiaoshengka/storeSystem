@@ -4,9 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 
-static int incomplete_or_error(size_t available, int end_of_stream)
+static int incomplete_or_error(size_t available,
+                               int end_of_stream,
+                               size_t max_frame_size)
 {
-    return end_of_stream || available >= RESP_MAX_FRAME_SIZE
+    return end_of_stream || available >= max_frame_size
                ? RESP_PARSE_ERROR
                : RESP_PARSE_INCOMPLETE;
 }
@@ -15,7 +17,8 @@ static int parse_decimal_line(const unsigned char *data,
                               size_t length,
                               size_t *position,
                               size_t *value,
-                              int end_of_stream)
+                              int end_of_stream,
+                              size_t max_frame_size)
 {
     size_t cursor = *position;
     size_t parsed = 0;
@@ -34,16 +37,18 @@ static int parse_decimal_line(const unsigned char *data,
         parsed = parsed * 10U + digit;
         digits++;
         cursor++;
-        if (cursor > RESP_MAX_FRAME_SIZE) {
+        if (cursor > max_frame_size) {
             return RESP_PARSE_ERROR;
         }
     }
     if (cursor >= length) {
-        return incomplete_or_error(length, end_of_stream);
+        return incomplete_or_error(length, end_of_stream, max_frame_size);
     }
     if (digits == 0 || cursor + 1U >= length) {
         return digits == 0 ? RESP_PARSE_ERROR
-                           : incomplete_or_error(length, end_of_stream);
+                           : incomplete_or_error(length,
+                                                 end_of_stream,
+                                                 max_frame_size);
     }
     if (data[cursor + 1U] != '\n') {
         return RESP_PARSE_ERROR;
@@ -59,12 +64,28 @@ int resp_parse_request(const unsigned char *data,
                        resp_request_t *request,
                        size_t *consumed)
 {
+    return resp_parse_request_with_limit(data,
+                                         length,
+                                         end_of_stream,
+                                         RESP_MAX_FRAME_SIZE,
+                                         request,
+                                         consumed);
+}
+
+int resp_parse_request_with_limit(const unsigned char *data,
+                                  size_t length,
+                                  int end_of_stream,
+                                  size_t max_frame_size,
+                                  resp_request_t *request,
+                                  size_t *consumed)
+{
     size_t argument_count;
     size_t position = 0;
     size_t index;
     int result;
 
-    if (request == NULL || consumed == NULL || (data == NULL && length != 0)) {
+    if (request == NULL || consumed == NULL || max_frame_size == 0 ||
+        (data == NULL && length != 0)) {
         return RESP_PARSE_ERROR;
     }
     request->argument_count = 0;
@@ -79,7 +100,8 @@ int resp_parse_request(const unsigned char *data,
                                 length,
                                 &position,
                                 &argument_count,
-                                end_of_stream);
+                                end_of_stream,
+                                max_frame_size);
     if (result != RESP_PARSE_COMPLETE) {
         return result;
     }
@@ -91,7 +113,9 @@ int resp_parse_request(const unsigned char *data,
         size_t bulk_length;
 
         if (position >= length) {
-            return incomplete_or_error(length, end_of_stream);
+            return incomplete_or_error(length,
+                                       end_of_stream,
+                                       max_frame_size);
         }
         if (data[position++] != '$') {
             return RESP_PARSE_ERROR;
@@ -100,24 +124,29 @@ int resp_parse_request(const unsigned char *data,
                                     length,
                                     &position,
                                     &bulk_length,
-                                    end_of_stream);
+                                    end_of_stream,
+                                    max_frame_size);
         if (result != RESP_PARSE_COMPLETE) {
             return result;
         }
-        if (bulk_length > RESP_MAX_FRAME_SIZE ||
-            position > RESP_MAX_FRAME_SIZE - bulk_length) {
+        if (bulk_length > max_frame_size ||
+            position > max_frame_size - bulk_length) {
             return RESP_PARSE_ERROR;
         }
         if (length - position < bulk_length) {
-            return incomplete_or_error(length, end_of_stream);
+            return incomplete_or_error(length,
+                                       end_of_stream,
+                                       max_frame_size);
         }
         request->arguments[index].data = data + position;
         request->arguments[index].length = bulk_length;
         position += bulk_length;
         if (position + 2U > length) {
-            return incomplete_or_error(length, end_of_stream);
+            return incomplete_or_error(length,
+                                       end_of_stream,
+                                       max_frame_size);
         }
-        if (position + 2U > RESP_MAX_FRAME_SIZE || data[position] != '\r' ||
+        if (position + 2U > max_frame_size || data[position] != '\r' ||
             data[position + 1U] != '\n') {
             return RESP_PARSE_ERROR;
         }

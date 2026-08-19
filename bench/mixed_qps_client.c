@@ -68,6 +68,7 @@ typedef struct benchmark_options {
     uint64_t ttl_ms;
     uint64_t seed;
     int cleanup;
+    int latency;
 } benchmark_options_t;
 
 typedef struct cache_snapshot {
@@ -100,6 +101,13 @@ typedef struct worker {
     uint64_t get_misses;
     uint64_t set_completed;
     uint64_t set_errors;
+    uint64_t *get_latencies_ns;
+    uint64_t *set_latencies_ns;
+    uint64_t get_latency_capacity;
+    uint64_t set_latency_capacity;
+    uint64_t get_latency_count;
+    uint64_t set_latency_count;
+    int latency_enabled;
     unsigned int pipeline_depth;
     char *command_buffer;
     size_t command_buffer_capacity;
@@ -116,10 +124,11 @@ static void print_usage(const char *program)
     fprintf(stderr,
             "Usage: %s [-s IPv4] [-p port] [-c connections] "
             "[-n total_requests] [-w warmup_gets_per_connection] "
-            "[-P pipeline_depth] [-k keyspace] [-T ttl_ms] [-S seed] [-C]\n"
+            "[-P pipeline_depth] [-k keyspace] [-T ttl_ms] [-S seed] [-C] [-L]\n"
             "  -k  Total shared keyspace; all keys are preloaded before timing.\n"
             "  -T  Apply SET PX ttl_ms during preload and measured writes; 0 disables TTL.\n"
             "  -C  Keep benchmark keys instead of deleting them after the run.\n"
+            "  -L  Measure per-response latency percentiles (adds client overhead).\n"
             "total_requests must be a multiple of 10.\n"
             "Defaults: -s %s -p %u -c %u -n %u -w %u -P %u "
             "-k %u -T 0 -S %u, cleanup enabled\n",
@@ -169,7 +178,7 @@ static int parse_options(int argc, char **argv, benchmark_options_t *options)
     options->seed = DEFAULT_SEED;
     options->cleanup = 1;
 
-    while ((option = getopt(argc, argv, "s:p:c:n:w:P:k:T:S:Ch")) != -1) {
+    while ((option = getopt(argc, argv, "s:p:c:n:w:P:k:T:S:CLh")) != -1) {
         uint64_t value;
 
         switch (option) {
@@ -206,6 +215,9 @@ static int parse_options(int argc, char **argv, benchmark_options_t *options)
             break;
         case 'C':
             options->cleanup = 0;
+            break;
+        case 'L':
+            options->latency = 1;
             break;
         case 'h':
             print_usage(argv[0]);
@@ -585,6 +597,71 @@ static int operation_is_set(uint64_t global_index, uint64_t seed)
     return slot == set_slot;
 }
 
+static uint64_t count_set_operations(uint64_t start,
+                                     uint64_t count,
+                                     uint64_t seed)
+{
+    uint64_t sets = 0;
+
+    while (count > 0U && start % 10U != 0U) {
+        if (operation_is_set(start, seed)) sets++;
+        start++;
+        count--;
+    }
+    sets += count / 10U;
+    start += (count / 10U) * 10U;
+    count %= 10U;
+    while (count > 0U) {
+        if (operation_is_set(start, seed)) sets++;
+        start++;
+        count--;
+    }
+    return sets;
+}
+
+static uint64_t elapsed_nanoseconds(const struct timespec *start,
+                                    const struct timespec *end)
+{
+    time_t seconds = end->tv_sec - start->tv_sec;
+    long nanoseconds = end->tv_nsec - start->tv_nsec;
+
+    if (nanoseconds < 0) {
+        seconds--;
+        nanoseconds += 1000000000L;
+    }
+    return (uint64_t)seconds * UINT64_C(1000000000) +
+           (uint64_t)nanoseconds;
+}
+
+static int record_latency(worker_t *worker,
+                          operation_type_t operation,
+                          const struct timespec *batch_start)
+{
+    struct timespec response_time;
+    uint64_t latency;
+
+    if (!worker->latency_enabled) return 0;
+    if (batch_start == NULL ||
+        clock_gettime(CLOCK_MONOTONIC, &response_time) != 0) {
+        return -1;
+    }
+    latency = elapsed_nanoseconds(batch_start, &response_time);
+    if (operation == OPERATION_GET) {
+        if (worker->get_latency_count >= worker->get_latency_capacity) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        worker->get_latencies_ns[worker->get_latency_count++] = latency;
+    } else if (operation == OPERATION_SET) {
+        if (worker->set_latency_count >= worker->set_latency_capacity) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        worker->set_latencies_ns[worker->set_latency_count++] = latency;
+    }
+    return 0;
+}
+
 static int format_key(const worker_t *worker,
                       uint64_t key_index,
                       char *key,
@@ -671,7 +748,8 @@ static int append_operation(worker_t *worker,
 
 static int receive_batch(worker_t *worker,
                          unsigned int count,
-                         batch_phase_t phase)
+                         batch_phase_t phase,
+                         const struct timespec *batch_start)
 {
     unsigned int index;
 
@@ -705,6 +783,10 @@ static int receive_batch(worker_t *worker,
         } else if (receive_del_reply(worker) != 0) {
             return -1;
         }
+        if (phase == PHASE_MEASURED &&
+            record_latency(worker, operation, batch_start) != 0) {
+            return -1;
+        }
     }
     return 0;
 }
@@ -734,7 +816,7 @@ static int execute_preload_or_cleanup(worker_t *worker, batch_phase_t phase)
             }
         }
         if (send_all(worker->fd, worker->command_buffer, used) != 0 ||
-            receive_batch(worker, count, phase) != 0) {
+            receive_batch(worker, count, phase, NULL) != 0) {
             return -1;
         }
         offset += count;
@@ -754,6 +836,8 @@ static int execute_random_requests(worker_t *worker,
                                  ? (unsigned int)remaining
                                  : worker->pipeline_depth;
         size_t used = 0;
+        struct timespec batch_start;
+        const struct timespec *batch_start_pointer = NULL;
         unsigned int index;
 
         for (index = 0; index < count; ++index) {
@@ -773,8 +857,17 @@ static int execute_random_requests(worker_t *worker,
                 return -1;
             }
         }
+        if (phase == PHASE_MEASURED && worker->latency_enabled) {
+            if (clock_gettime(CLOCK_MONOTONIC, &batch_start) != 0) {
+                return -1;
+            }
+            batch_start_pointer = &batch_start;
+        }
         if (send_all(worker->fd, worker->command_buffer, used) != 0 ||
-            receive_batch(worker, count, phase) != 0) {
+            receive_batch(worker,
+                          count,
+                          phase,
+                          batch_start_pointer) != 0) {
             return -1;
         }
         offset += count;
@@ -823,6 +916,158 @@ static double elapsed_seconds(const struct timespec *start, const struct timespe
     return (double)seconds + (double)nanoseconds / 1000000000.0;
 }
 
+static int compare_u64(const void *left, const void *right)
+{
+    uint64_t left_value = *(const uint64_t *)left;
+    uint64_t right_value = *(const uint64_t *)right;
+
+    return left_value < right_value ? -1 : left_value > right_value;
+}
+
+static size_t percentile_index(size_t count,
+                               size_t numerator,
+                               size_t denominator)
+{
+    size_t rank = (count / denominator) * numerator;
+    size_t remainder = count % denominator;
+
+    rank += (remainder * numerator + denominator - 1U) / denominator;
+    return rank == 0U ? 0U : rank - 1U;
+}
+
+static uint64_t merged_value_at(const uint64_t *left,
+                                size_t left_count,
+                                const uint64_t *right,
+                                size_t right_count,
+                                size_t index)
+{
+    size_t selected = index + 1U;
+    size_t low = selected > right_count ? selected - right_count : 0U;
+    size_t high = selected < left_count ? selected : left_count;
+
+    for (;;) {
+        size_t left_selected = low + (high - low) / 2U;
+        size_t right_selected = selected - left_selected;
+
+        if (left_selected > 0U && right_selected < right_count &&
+            left[left_selected - 1U] > right[right_selected]) {
+            high = left_selected - 1U;
+        } else if (right_selected > 0U && left_selected < left_count &&
+                   right[right_selected - 1U] > left[left_selected]) {
+            low = left_selected + 1U;
+        } else if (left_selected == 0U) {
+            return right[right_selected - 1U];
+        } else if (right_selected == 0U) {
+            return left[left_selected - 1U];
+        } else {
+            uint64_t left_value = left[left_selected - 1U];
+            uint64_t right_value = right[right_selected - 1U];
+
+            return left_value > right_value ? left_value : right_value;
+        }
+    }
+}
+
+static long double latency_sum(const uint64_t *values, size_t count)
+{
+    long double sum = 0.0L;
+    size_t index;
+
+    for (index = 0; index < count; ++index) sum += values[index];
+    return sum;
+}
+
+static void print_latency_summary(const char *prefix,
+                                  const uint64_t *values,
+                                  size_t count)
+{
+    uint64_t p50;
+    uint64_t p95;
+    uint64_t p99;
+    uint64_t p999;
+    uint64_t maximum;
+    long double mean;
+
+    if (count == 0U) {
+        printf("%s_latency_samples: 0\n", prefix);
+        return;
+    }
+    p50 = values[percentile_index(count, 50U, 100U)];
+    p95 = values[percentile_index(count, 95U, 100U)];
+    p99 = values[percentile_index(count, 99U, 100U)];
+    p999 = values[percentile_index(count, 999U, 1000U)];
+    maximum = values[count - 1U];
+    mean = latency_sum(values, count) / (long double)count;
+    printf("%s_latency_samples: %zu\n", prefix, count);
+    printf("%s_latency_mean_us: %.3Lf\n", prefix, mean / 1000.0L);
+    printf("%s_latency_p50_us: %.3f\n", prefix, (double)p50 / 1000.0);
+    printf("%s_latency_p95_us: %.3f\n", prefix, (double)p95 / 1000.0);
+    printf("%s_latency_p99_us: %.3f\n", prefix, (double)p99 / 1000.0);
+    printf("%s_latency_p999_us: %.3f\n", prefix, (double)p999 / 1000.0);
+    printf("%s_latency_max_us: %.3f\n", prefix, (double)maximum / 1000.0);
+    printf("%s_latency_p99_over_p50: %.3f\n",
+           prefix,
+           p50 > 0U ? (double)p99 / (double)p50 : 0.0);
+}
+
+static void print_merged_latency_summary(const uint64_t *get_values,
+                                         size_t get_count,
+                                         const uint64_t *set_values,
+                                         size_t set_count)
+{
+    size_t count = get_count + set_count;
+    uint64_t p50;
+    uint64_t p95;
+    uint64_t p99;
+    uint64_t p999;
+    uint64_t maximum;
+    long double mean;
+
+    if (count == 0U) {
+        printf("latency_samples: 0\n");
+        return;
+    }
+    p50 = merged_value_at(get_values,
+                          get_count,
+                          set_values,
+                          set_count,
+                          percentile_index(count, 50U, 100U));
+    p95 = merged_value_at(get_values,
+                          get_count,
+                          set_values,
+                          set_count,
+                          percentile_index(count, 95U, 100U));
+    p99 = merged_value_at(get_values,
+                          get_count,
+                          set_values,
+                          set_count,
+                          percentile_index(count, 99U, 100U));
+    p999 = merged_value_at(get_values,
+                           get_count,
+                           set_values,
+                           set_count,
+                           percentile_index(count, 999U, 1000U));
+    maximum = get_count == 0U
+                  ? set_values[set_count - 1U]
+                  : set_count == 0U
+                        ? get_values[get_count - 1U]
+                        : get_values[get_count - 1U] > set_values[set_count - 1U]
+                              ? get_values[get_count - 1U]
+                              : set_values[set_count - 1U];
+    mean = (latency_sum(get_values, get_count) +
+            latency_sum(set_values, set_count)) /
+           (long double)count;
+    printf("latency_samples: %zu\n", count);
+    printf("latency_mean_us: %.3Lf\n", mean / 1000.0L);
+    printf("latency_p50_us: %.3f\n", (double)p50 / 1000.0);
+    printf("latency_p95_us: %.3f\n", (double)p95 / 1000.0);
+    printf("latency_p99_us: %.3f\n", (double)p99 / 1000.0);
+    printf("latency_p999_us: %.3f\n", (double)p999 / 1000.0);
+    printf("latency_max_us: %.3f\n", (double)maximum / 1000.0);
+    printf("latency_p99_over_p50: %.3f\n",
+           p50 > 0U ? (double)p99 / (double)p50 : 0.0);
+}
+
 static int prepare_worker(worker_t *worker,
                           const benchmark_options_t *options,
                           benchmark_control_t *control,
@@ -847,6 +1092,7 @@ static int prepare_worker(worker_t *worker,
     worker->ttl_ms = options->ttl_ms;
     worker->pipeline_depth = options->pipeline;
     worker->schedule_seed = options->seed;
+    worker->latency_enabled = options->latency;
     worker->random_state = mix_u64(options->seed ^ ((uint64_t)worker_id + 1U));
     if (worker->random_state == 0U) worker->random_state = 1U;
     worker->control = control;
@@ -855,9 +1101,33 @@ static int prepare_worker(worker_t *worker,
     worker->pipeline_operations =
         malloc(sizeof(*worker->pipeline_operations) * options->pipeline);
     worker->receive_buffer = malloc(RECEIVE_BUFFER_SIZE);
+    if (worker->latency_enabled) {
+        worker->set_latency_capacity = count_set_operations(request_start,
+                                                            request_count,
+                                                            options->seed);
+        worker->get_latency_capacity = request_count -
+                                       worker->set_latency_capacity;
+        if (worker->get_latency_capacity > SIZE_MAX / sizeof(uint64_t) ||
+            worker->set_latency_capacity > SIZE_MAX / sizeof(uint64_t)) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        if (worker->get_latency_capacity > 0U) {
+            worker->get_latencies_ns =
+                malloc((size_t)worker->get_latency_capacity * sizeof(uint64_t));
+        }
+        if (worker->set_latency_capacity > 0U) {
+            worker->set_latencies_ns =
+                malloc((size_t)worker->set_latency_capacity * sizeof(uint64_t));
+        }
+    }
     if (worker->command_buffer == NULL ||
         worker->pipeline_operations == NULL ||
-        worker->receive_buffer == NULL) {
+        worker->receive_buffer == NULL ||
+        (worker->get_latency_capacity > 0U &&
+         worker->get_latencies_ns == NULL) ||
+        (worker->set_latency_capacity > 0U &&
+         worker->set_latencies_ns == NULL)) {
         return -1;
     }
     worker->fd = connect_server(options);
@@ -880,9 +1150,13 @@ static void cleanup_worker(worker_t *worker, int remove_keys)
     free(worker->receive_buffer);
     free(worker->pipeline_operations);
     free(worker->command_buffer);
+    free(worker->get_latencies_ns);
+    free(worker->set_latencies_ns);
     worker->receive_buffer = NULL;
     worker->pipeline_operations = NULL;
     worker->command_buffer = NULL;
+    worker->get_latencies_ns = NULL;
+    worker->set_latencies_ns = NULL;
 }
 
 int main(int argc, char **argv)
@@ -898,6 +1172,10 @@ int main(int argc, char **argv)
     uint64_t gets_completed = 0, get_hits = 0, get_misses = 0;
     uint64_t sets_completed = 0, set_errors = 0;
     uint64_t requested_gets, requested_sets;
+    uint64_t *get_latencies_ns = NULL;
+    uint64_t *set_latencies_ns = NULL;
+    size_t get_latency_count = 0;
+    size_t set_latency_count = 0;
     cache_snapshot_t before_snapshot;
     cache_snapshot_t after_snapshot;
     int before_snapshot_available = 0;
@@ -1018,6 +1296,67 @@ int main(int argc, char **argv)
     client_host[sizeof(client_host) - 1U] = '\0';
     requested_sets = options.requests / 10U;
     requested_gets = options.requests - requested_sets;
+    if (options.latency) {
+        size_t get_position = 0;
+        size_t set_position = 0;
+
+        for (index = 0; index < options.connections; ++index) {
+            if (workers[index].get_latency_count > SIZE_MAX - get_latency_count ||
+                workers[index].set_latency_count > SIZE_MAX - set_latency_count) {
+                errno = EOVERFLOW;
+                goto cleanup;
+            }
+            get_latency_count += (size_t)workers[index].get_latency_count;
+            set_latency_count += (size_t)workers[index].set_latency_count;
+        }
+        if (get_latency_count > SIZE_MAX / sizeof(uint64_t) ||
+            set_latency_count > SIZE_MAX / sizeof(uint64_t)) {
+            errno = EOVERFLOW;
+            goto cleanup;
+        }
+        if (get_latency_count > 0U) {
+            get_latencies_ns = malloc(get_latency_count * sizeof(uint64_t));
+        }
+        if (set_latency_count > 0U) {
+            set_latencies_ns = malloc(set_latency_count * sizeof(uint64_t));
+        }
+        if ((get_latency_count > 0U && get_latencies_ns == NULL) ||
+            (set_latency_count > 0U && set_latencies_ns == NULL)) {
+            fprintf(stderr, "failed to allocate aggregate latency samples\n");
+            goto cleanup;
+        }
+        for (index = 0; index < options.connections; ++index) {
+            size_t worker_get_count =
+                (size_t)workers[index].get_latency_count;
+            size_t worker_set_count =
+                (size_t)workers[index].set_latency_count;
+
+            if (worker_get_count > 0U) {
+                memcpy(get_latencies_ns + get_position,
+                       workers[index].get_latencies_ns,
+                       worker_get_count * sizeof(uint64_t));
+                get_position += worker_get_count;
+            }
+            if (worker_set_count > 0U) {
+                memcpy(set_latencies_ns + set_position,
+                       workers[index].set_latencies_ns,
+                       worker_set_count * sizeof(uint64_t));
+                set_position += worker_set_count;
+            }
+        }
+        if (get_latency_count > 0U) {
+            qsort(get_latencies_ns,
+                  get_latency_count,
+                  sizeof(uint64_t),
+                  compare_u64);
+        }
+        if (set_latency_count > 0U) {
+            qsort(set_latencies_ns,
+                  set_latency_count,
+                  sizeof(uint64_t),
+                  compare_u64);
+        }
+    }
     {
         uint64_t completed = gets_completed + sets_completed;
         double seconds = elapsed_seconds(&start, &end);
@@ -1038,6 +1377,8 @@ int main(int argc, char **argv)
         printf("random_seed: %" PRIu64 "\n", options.seed);
         printf("warmup_gets_per_connection: %" PRIu64 "\n", options.warmup);
         printf("cleanup: %s\n", options.cleanup ? "enabled" : "disabled");
+        printf("latency_measurement: %s\n",
+               options.latency ? "enabled" : "disabled");
         printf("requests_requested: %" PRIu64 "\n", options.requests);
         printf("get_requested: %" PRIu64 "\n", requested_gets);
         printf("set_requested: %" PRIu64 "\n", requested_sets);
@@ -1082,6 +1423,21 @@ int main(int argc, char **argv)
         }
         printf("duration_seconds: %.6f\n", seconds);
         printf("qps: %.2f\n", qps);
+        if (options.latency) {
+            printf("latency_unit: microseconds\n");
+            printf("latency_clock: CLOCK_MONOTONIC\n");
+            printf("latency_definition: pipeline_send_start_to_response_parsed\n");
+            print_merged_latency_summary(get_latencies_ns,
+                                         get_latency_count,
+                                         set_latencies_ns,
+                                         set_latency_count);
+            print_latency_summary("get",
+                                  get_latencies_ns,
+                                  get_latency_count);
+            print_latency_summary("set",
+                                  set_latencies_ns,
+                                  set_latency_count);
+        }
         printf("tcp_nodelay: on\n");
     }
     exit_code = gets_completed == requested_gets &&
@@ -1107,6 +1463,8 @@ cleanup:
     }
     free(threads);
     free(workers);
+    free(get_latencies_ns);
+    free(set_latencies_ns);
     pthread_cond_destroy(&control.condition);
     pthread_mutex_destroy(&control.mutex);
     return exit_code;

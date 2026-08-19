@@ -59,6 +59,8 @@ struct reactor {
     reactor_connection_t *timer_source;
     reactor_periodic_handler periodic_handler;
     void *periodic_context;
+    reactor_flush_handler flush_handler;
+    void *flush_context;
     reactor_connection_t *clients;
 };
 
@@ -494,6 +496,7 @@ int reactor_run(reactor_t *reactor)
     while (!reactor->stopping) {
         int ready = epoll_wait(reactor->epoll_fd, events, REACTOR_MAX_EVENTS, -1);
         int index;
+        int flush_failed = 0;
 
         if (ready < 0) {
             if (errno == EINTR) {
@@ -542,13 +545,43 @@ int reactor_run(reactor_t *reactor)
                 result = handle_read(source);
             }
             if (result == 0 && (active & EPOLLOUT) != 0) {
+                if (reactor->flush_handler != NULL &&
+                    reactor->flush_handler(reactor->flush_context) != 0) {
+                    flush_failed = 1;
+                    break;
+                }
                 result = handle_write(source);
             }
             if (result != 0 || (source->peer_eof && net_buffer_readable(&source->output) == 0)) {
                 connection_destroy(source);
             }
         }
+        if (flush_failed) {
+            while (reactor->clients != NULL) {
+                connection_destroy(reactor->clients);
+            }
+            continue;
+        }
+        if (reactor->flush_handler != NULL &&
+            reactor->flush_handler(reactor->flush_context) != 0) {
+            while (reactor->clients != NULL) {
+                connection_destroy(reactor->clients);
+            }
+        }
     }
+    return 0;
+}
+
+int reactor_set_flush_handler(reactor_t *reactor,
+                              reactor_flush_handler handler,
+                              void *handler_context)
+{
+    if (reactor == NULL || handler == NULL || reactor->flush_handler != NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    reactor->flush_handler = handler;
+    reactor->flush_context = handler_context;
     return 0;
 }
 

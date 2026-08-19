@@ -38,6 +38,8 @@ struct cache {
     size_t heap_capacity;
     size_t used_memory;
     cache_config_t config;
+    cache_eviction_fn on_evict;
+    void *eviction_context;
     uint64_t hits;
     uint64_t misses;
     uint64_t expired_keys;
@@ -266,6 +268,11 @@ static void entry_remove(cache_t *cache,
                          cache_entry_t *entry,
                          enum removal_reason reason)
 {
+    if (reason == REMOVE_EVICTED && cache->on_evict != NULL) {
+        cache->on_evict(kv_hash_node_key(entry->index_node),
+                        kv_hash_node_key_length(entry->index_node),
+                        cache->eviction_context);
+    }
     if (entry->heap_index != CACHE_HEAP_NONE) {
         heap_remove_at(cache, entry->heap_index);
     }
@@ -363,17 +370,27 @@ void cache_destroy(cache_t *cache)
     free(cache);
 }
 
-int cache_set(cache_t *cache,
-              const void *key,
-              size_t key_length,
-              const void *value,
-              size_t value_length,
-              uint64_t ttl_ms)
+void cache_set_eviction_callback(cache_t *cache,
+                                 cache_eviction_fn callback,
+                                 void *context)
+{
+    if (cache != NULL) {
+        cache->on_evict = callback;
+        cache->eviction_context = context;
+    }
+}
+
+int cache_set_expire_at(cache_t *cache,
+                        const void *key,
+                        size_t key_length,
+                        const void *value,
+                        size_t value_length,
+                        uint64_t expire_at_ms)
 {
     cache_entry_t *entry;
     unsigned char *replacement;
     uint64_t now;
-    uint64_t expire_at = 0;
+    uint64_t expire_at = expire_at_ms;
     size_t new_charge;
 
     if (cache == NULL || !valid_bytes(key, key_length) ||
@@ -381,12 +398,6 @@ int cache_set(cache_t *cache,
         return CACHE_SET_ERROR;
     }
     now = cache_now(cache);
-    if (ttl_ms != 0) {
-        if (ttl_ms > UINT64_MAX - now) {
-            return CACHE_SET_RANGE;
-        }
-        expire_at = now + ttl_ms;
-    }
     new_charge = entry_memory_charge(key_length, value_length);
     if (new_charge == SIZE_MAX ||
         (cache->config.max_memory != 0 &&
@@ -493,6 +504,30 @@ int cache_set(cache_t *cache,
     return CACHE_SET_OK;
 }
 
+int cache_set(cache_t *cache,
+              const void *key,
+              size_t key_length,
+              const void *value,
+              size_t value_length,
+              uint64_t ttl_ms)
+{
+    uint64_t now;
+
+    if (cache == NULL) {
+        return CACHE_SET_ERROR;
+    }
+    now = cache_now(cache);
+    if (ttl_ms != 0 && ttl_ms > UINT64_MAX - now) {
+        return CACHE_SET_RANGE;
+    }
+    return cache_set_expire_at(cache,
+                               key,
+                               key_length,
+                               value,
+                               value_length,
+                               ttl_ms == 0 ? 0 : now + ttl_ms);
+}
+
 const void *cache_get(cache_t *cache,
                       const void *key,
                       size_t key_length,
@@ -533,16 +568,46 @@ int cache_delete(cache_t *cache, const void *key, size_t key_length)
     return 1;
 }
 
+int cache_expire_at(cache_t *cache,
+                    const void *key,
+                    size_t key_length,
+                    uint64_t expire_at_ms)
+{
+    cache_entry_t *entry;
+    uint64_t now;
+
+    if (cache == NULL || !valid_bytes(key, key_length)) {
+        return -1;
+    }
+    if (expire_at_ms == 0) {
+        return cache_delete(cache, key, key_length);
+    }
+    now = cache_now(cache);
+    entry = find_live(cache, key, key_length, now);
+    if (entry == NULL) {
+        return 0;
+    }
+    if (entry->expire_at_ms == 0) {
+        if (heap_reserve(cache, cache->heap_count + 1U) != 0) {
+            return -1;
+        }
+        entry->expire_at_ms = expire_at_ms;
+        heap_insert_reserved(cache, entry);
+    } else {
+        entry->expire_at_ms = expire_at_ms;
+        heap_expiration_changed(cache, entry);
+    }
+    return 1;
+}
+
 int cache_expire(cache_t *cache,
                  const void *key,
                  size_t key_length,
                  uint64_t ttl_ms)
 {
-    cache_entry_t *entry;
     uint64_t now;
-    uint64_t deadline;
 
-    if (cache == NULL || !valid_bytes(key, key_length)) {
+    if (cache == NULL) {
         return -1;
     }
     if (ttl_ms == 0) {
@@ -552,22 +617,7 @@ int cache_expire(cache_t *cache,
     if (ttl_ms > UINT64_MAX - now) {
         return -2;
     }
-    deadline = now + ttl_ms;
-    entry = find_live(cache, key, key_length, now);
-    if (entry == NULL) {
-        return 0;
-    }
-    if (entry->expire_at_ms == 0) {
-        if (heap_reserve(cache, cache->heap_count + 1U) != 0) {
-            return -1;
-        }
-        entry->expire_at_ms = deadline;
-        heap_insert_reserved(cache, entry);
-    } else {
-        entry->expire_at_ms = deadline;
-        heap_expiration_changed(cache, entry);
-    }
-    return 1;
+    return cache_expire_at(cache, key, key_length, now + ttl_ms);
 }
 
 int cache_persist(cache_t *cache, const void *key, size_t key_length)
@@ -659,4 +709,9 @@ void cache_get_stats(const cache_t *cache, cache_stats_t *stats)
     stats->evicted_keys = cache->evicted_keys;
     stats->hash_slots = kv_hash_slot_count(cache->index);
     stats->rehashing = kv_hash_is_rehashing(cache->index);
+}
+
+uint64_t cache_current_time_ms(const cache_t *cache)
+{
+    return cache == NULL ? 0 : cache_now(cache);
 }

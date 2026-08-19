@@ -28,6 +28,12 @@ int resp_parse_request(const unsigned char *data,
                        int end_of_stream,
                        resp_request_t *request,
                        size_t *consumed);
+int resp_parse_request_with_limit(const unsigned char *data,
+                                  size_t length,
+                                  int end_of_stream,
+                                  size_t max_frame_size,
+                                  resp_request_t *request,
+                                  size_t *consumed);
 
 int resp_encode_simple_string(unsigned char *output,
                               size_t capacity,
