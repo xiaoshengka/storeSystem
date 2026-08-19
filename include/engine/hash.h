@@ -26,6 +26,8 @@ void *kv_hash_remove_node(hashtable_t *hash, kv_hash_node_t *target);
 
 void *kv_hash_node_payload(const kv_hash_node_t *node);
 void kv_hash_node_set_payload(kv_hash_node_t *node, void *payload);
+const void *kv_hash_node_key(const kv_hash_node_t *node);
+size_t kv_hash_node_key_length(const kv_hash_node_t *node);
 
 size_t kv_hash_count(const hashtable_t *hash);
 size_t kv_hash_slot_count(const hashtable_t *hash);

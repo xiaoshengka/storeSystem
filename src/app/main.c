@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "net/reactor.h"
+#include "persistence/aof.h"
 #include "protocol/resp.h"
 #include "service/kvstore_service.h"
 
@@ -9,12 +10,29 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef NETWORK_BACKEND_NTYCO
 #define DEFAULT_PORT 9096U
 #define CACHE_MAINTENANCE_INTERVAL_MS 100U
 
 static reactor_t *active_reactor;
+
+static double elapsed_seconds(const struct timespec *start,
+                              const struct timespec *end)
+{
+    time_t seconds = end->tv_sec - start->tv_sec;
+    long nanoseconds = end->tv_nsec - start->tv_nsec;
+
+    return (double)seconds + (double)nanoseconds / 1000000000.0;
+}
+
+typedef struct app_options {
+    cache_config_t cache;
+    int appendonly;
+    const char *appendfilename;
+    aof_fsync_policy_t appendfsync;
+} app_options_t;
 
 static void handle_stop_signal(int signal_number)
 {
@@ -140,6 +158,11 @@ static int maintain_cache(void *context)
     return kvstore_service_maintain(context);
 }
 
+static int flush_service(void *context)
+{
+    return kvstore_service_flush(context);
+}
+
 static int suffix_equals(const char *value, const char *expected)
 {
     while (*value != '\0' && *expected != '\0') {
@@ -201,18 +224,27 @@ static void print_usage(const char *program)
 {
     fprintf(stderr,
             "Usage: %s [--maxmemory SIZE] [--maxkeys COUNT]\n"
+            "          [--appendonly yes|no] [--appendfilename PATH]\n"
+            "          [--appendfsync always|everysec|no]\n"
             "  SIZE accepts bytes or KiB/MiB/GiB suffixes; 0 means unlimited.\n"
-            "  COUNT is an unsigned decimal integer; 0 means unlimited.\n",
+            "  COUNT is an unsigned decimal integer; 0 means unlimited.\n"
+            "  AOF defaults: appendonly=no, appendfilename=appendonly.aof,\n"
+            "                appendfsync=everysec.\n",
             program);
 }
 
-static int parse_options(int argc, char **argv, cache_config_t *config)
+static int parse_options(int argc, char **argv, app_options_t *options)
 {
     int saw_maxmemory = 0;
     int saw_maxkeys = 0;
+    int saw_appendonly = 0;
+    int saw_appendfilename = 0;
+    int saw_appendfsync = 0;
     int index;
 
-    memset(config, 0, sizeof(*config));
+    memset(options, 0, sizeof(*options));
+    options->appendfilename = "appendonly.aof";
+    options->appendfsync = AOF_FSYNC_EVERYSEC;
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
         print_usage(argv[0]);
         return 1;
@@ -223,17 +255,49 @@ static int parse_options(int argc, char **argv, cache_config_t *config)
             return -1;
         }
         if (strcmp(argv[index], "--maxmemory") == 0 && !saw_maxmemory) {
-            if (parse_size(argv[index + 1], 1, &config->max_memory) != 0) {
+            if (parse_size(argv[index + 1],
+                           1,
+                           &options->cache.max_memory) != 0) {
                 print_usage(argv[0]);
                 return -1;
             }
             saw_maxmemory = 1;
         } else if (strcmp(argv[index], "--maxkeys") == 0 && !saw_maxkeys) {
-            if (parse_size(argv[index + 1], 0, &config->max_keys) != 0) {
+            if (parse_size(argv[index + 1],
+                           0,
+                           &options->cache.max_keys) != 0) {
                 print_usage(argv[0]);
                 return -1;
             }
             saw_maxkeys = 1;
+        } else if (strcmp(argv[index], "--appendonly") == 0 &&
+                   !saw_appendonly) {
+            if (suffix_equals(argv[index + 1], "yes")) {
+                options->appendonly = 1;
+            } else if (suffix_equals(argv[index + 1], "no")) {
+                options->appendonly = 0;
+            } else {
+                print_usage(argv[0]);
+                return -1;
+            }
+            saw_appendonly = 1;
+        } else if (strcmp(argv[index], "--appendfilename") == 0 &&
+                   !saw_appendfilename && argv[index + 1][0] != '\0') {
+            options->appendfilename = argv[index + 1];
+            saw_appendfilename = 1;
+        } else if (strcmp(argv[index], "--appendfsync") == 0 &&
+                   !saw_appendfsync) {
+            if (suffix_equals(argv[index + 1], "always")) {
+                options->appendfsync = AOF_FSYNC_ALWAYS;
+            } else if (suffix_equals(argv[index + 1], "everysec")) {
+                options->appendfsync = AOF_FSYNC_EVERYSEC;
+            } else if (suffix_equals(argv[index + 1], "no")) {
+                options->appendfsync = AOF_FSYNC_NO;
+            } else {
+                print_usage(argv[0]);
+                return -1;
+            }
+            saw_appendfsync = 1;
         } else {
             print_usage(argv[0]);
             return -1;
@@ -244,30 +308,72 @@ static int parse_options(int argc, char **argv, cache_config_t *config)
 
 int main(int argc, char **argv)
 {
-    cache_config_t cache_config;
+    app_options_t options;
     kvstore_service_t service;
     reactor_t *reactor = NULL;
+    aof_t *aof = NULL;
+    aof_replay_stats_t replay_stats;
+    double replay_duration_seconds = 0.0;
     int parse_result;
     int result = 1;
 
-    parse_result = parse_options(argc, argv, &cache_config);
+    parse_result = parse_options(argc, argv, &options);
     if (parse_result != 0) {
         return parse_result > 0 ? 0 : 2;
     }
-    if (kvstore_service_init(&service, &cache_config) != 0) {
+    if (kvstore_service_init(&service, &options.cache) != 0) {
         fprintf(stderr, "failed to initialize Hash cache\n");
         return 1;
     }
+    memset(&replay_stats, 0, sizeof(replay_stats));
+    if (options.appendonly) {
+        struct timespec replay_start;
+        struct timespec replay_end;
+
+        if (aof_open(&aof,
+                     options.appendfilename,
+                     options.appendfsync) != 0) {
+            perror("aof_open");
+            goto cleanup_service;
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &replay_start) != 0) {
+            perror("clock_gettime");
+            goto cleanup_aof;
+        }
+        if (aof_replay(aof,
+                       kvstore_service_replay_aof,
+                       &service,
+                       &replay_stats) != 0) {
+            perror("aof_replay");
+            goto cleanup_aof;
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &replay_end) != 0) {
+            perror("clock_gettime");
+            goto cleanup_aof;
+        }
+        replay_duration_seconds = elapsed_seconds(&replay_start, &replay_end);
+        fprintf(stderr,
+                "aof_replay_commands: %zu\n"
+                "aof_replay_duration_seconds: %.9f\n",
+                replay_stats.commands_loaded,
+                replay_duration_seconds);
+        if (replay_stats.truncated_tail_repaired) {
+            fprintf(stderr,
+                    "warning: repaired an incomplete AOF tail in %s\n",
+                    options.appendfilename);
+        }
+        kvstore_service_attach_aof(&service, aof);
+    }
     if (install_signal_handlers() != 0) {
         perror("sigaction");
-        goto cleanup_service;
+        goto cleanup_aof;
     }
     if (reactor_init(&reactor,
                      (uint16_t)DEFAULT_PORT,
                      dispatch_request,
                      &service) != 0) {
         perror("reactor_init");
-        goto cleanup_service;
+        goto cleanup_aof;
     }
     if (reactor_set_periodic(reactor,
                              CACHE_MAINTENANCE_INTERVAL_MS,
@@ -276,13 +382,19 @@ int main(int argc, char **argv)
         perror("reactor_set_periodic");
         goto cleanup_reactor;
     }
+    if (reactor_set_flush_handler(reactor, flush_service, &service) != 0) {
+        perror("reactor_set_flush_handler");
+        goto cleanup_reactor;
+    }
 
     active_reactor = reactor;
-    printf("storeSystem v0.4.0 RESP reactor listening on port %u "
-           "(engine=hash, maxmemory=%zu, maxkeys=%zu)\n",
+    printf("storeSystem v0.5.1 RESP reactor listening on port %u "
+           "(engine=hash, maxmemory=%zu, maxkeys=%zu, aof=%s, loaded=%zu)\n",
            DEFAULT_PORT,
-           cache_config.max_memory,
-           cache_config.max_keys);
+           options.cache.max_memory,
+           options.cache.max_keys,
+           options.appendonly ? options.appendfilename : "off",
+           replay_stats.commands_loaded);
     if (reactor_run(reactor) != 0 && errno != EINTR) {
         perror("reactor_run");
         goto cleanup_reactor;
@@ -292,6 +404,12 @@ int main(int argc, char **argv)
 cleanup_reactor:
     active_reactor = NULL;
     reactor_destroy(reactor);
+cleanup_aof:
+    kvstore_service_attach_aof(&service, NULL);
+    if (aof_close(aof) != 0) {
+        perror("aof_close");
+        result = 1;
+    }
 cleanup_service:
     kvstore_service_destroy(&service);
     return result;

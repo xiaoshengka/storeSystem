@@ -15,6 +15,7 @@ static const unsigned char error_integer[] =
     "ERR value is not an integer or out of range";
 static const unsigned char error_expire[] = "ERR invalid expire time in SET";
 static const unsigned char error_capacity[] = "ERR cache capacity exceeded";
+static const unsigned char error_aof[] = "ERR AOF persistence unavailable";
 
 enum service_command {
     SERVICE_COMMAND_SET,
@@ -69,6 +70,14 @@ static enum service_command find_command(const kvstore_argument_t *argument)
     return SERVICE_COMMAND_UNKNOWN;
 }
 
+static int is_write_command(enum service_command command)
+{
+    return command == SERVICE_COMMAND_SET || command == SERVICE_COMMAND_DEL ||
+           command == SERVICE_COMMAND_EXPIRE ||
+           command == SERVICE_COMMAND_PEXPIRE ||
+           command == SERVICE_COMMAND_PERSIST;
+}
+
 static void set_data_reply(kvstore_reply_t *reply,
                            kvstore_reply_type_t type,
                            const unsigned char *data,
@@ -85,6 +94,11 @@ static void set_error(kvstore_reply_t *reply,
                       size_t length)
 {
     set_data_reply(reply, KVSTORE_REPLY_ERROR, message, length);
+}
+
+static void set_aof_error(kvstore_reply_t *reply)
+{
+    set_error(reply, error_aof, sizeof(error_aof) - 1U);
 }
 
 static void set_integer(kvstore_reply_t *reply, int64_t value)
@@ -135,6 +149,122 @@ static int parse_int64(const kvstore_argument_t *argument, int64_t *result)
     return 0;
 }
 
+static int parse_uint64_bytes(const unsigned char *data,
+                              size_t length,
+                              uint64_t *result)
+{
+    uint64_t value = 0;
+    size_t index;
+
+    if (data == NULL || result == NULL || length == 0) {
+        return -1;
+    }
+    for (index = 0; index < length; ++index) {
+        unsigned int digit;
+
+        if (data[index] < '0' || data[index] > '9') {
+            return -1;
+        }
+        digit = (unsigned int)(data[index] - '0');
+        if (value > (UINT64_MAX - digit) / 10U) {
+            return -1;
+        }
+        value = value * 10U + digit;
+    }
+    *result = value;
+    return 0;
+}
+
+static aof_argument_t aof_argument(const void *data, size_t length)
+{
+    aof_argument_t result;
+
+    result.data = data;
+    result.length = length;
+    return result;
+}
+
+static int append_key_command(kvstore_service_t *service,
+                              const char *command,
+                              const kvstore_argument_t *key)
+{
+    aof_argument_t arguments[2];
+
+    if (service->aof == NULL) {
+        return 0;
+    }
+    arguments[0] = aof_argument(command, strlen(command));
+    arguments[1] = aof_argument(key->data, key->length);
+    return aof_append(service->aof, arguments, 2U);
+}
+
+static int append_deadline_command(kvstore_service_t *service,
+                                   const char *command,
+                                   const kvstore_argument_t *key,
+                                   uint64_t deadline)
+{
+    aof_argument_t arguments[3];
+    char deadline_text[32];
+    int length;
+
+    if (service->aof == NULL) {
+        return 0;
+    }
+    length = snprintf(deadline_text,
+                      sizeof(deadline_text),
+                      "%" PRIu64,
+                      deadline);
+    if (length < 0 || (size_t)length >= sizeof(deadline_text)) {
+        return -1;
+    }
+    arguments[0] = aof_argument(command, strlen(command));
+    arguments[1] = aof_argument(key->data, key->length);
+    arguments[2] = aof_argument(deadline_text, (size_t)length);
+    return aof_append(service->aof, arguments, 3U);
+}
+
+static int append_set_command(kvstore_service_t *service,
+                              const kvstore_argument_t *arguments,
+                              uint64_t deadline)
+{
+    aof_argument_t record[5];
+    char deadline_text[32];
+    size_t count = 3U;
+    int length;
+
+    if (service->aof == NULL) {
+        return 0;
+    }
+    record[0] = aof_argument("SET", 3U);
+    record[1] = aof_argument(arguments[1].data, arguments[1].length);
+    record[2] = aof_argument(arguments[2].data, arguments[2].length);
+    if (deadline != 0) {
+        length = snprintf(deadline_text,
+                          sizeof(deadline_text),
+                          "%" PRIu64,
+                          deadline);
+        if (length < 0 || (size_t)length >= sizeof(deadline_text)) {
+            return -1;
+        }
+        record[3] = aof_argument("PXAT", 4U);
+        record[4] = aof_argument(deadline_text, (size_t)length);
+        count = 5U;
+    }
+    return aof_append(service->aof, record, count);
+}
+
+static void record_eviction(const void *key,
+                            size_t key_length,
+                            void *context)
+{
+    kvstore_service_t *service = context;
+    kvstore_argument_t argument;
+
+    argument.data = key;
+    argument.length = key_length;
+    (void)append_key_command(service, "DEL", &argument);
+}
+
 static int duration_ms(const kvstore_argument_t *argument,
                        uint64_t multiplier,
                        int require_positive,
@@ -167,6 +297,7 @@ int kvstore_service_init(kvstore_service_t *service,
     if (cache_create(&service->cache, cache_config) != 0) {
         return -1;
     }
+    cache_set_eviction_callback(service->cache, record_eviction, service);
     service->initialized = 1;
     return 0;
 }
@@ -186,7 +317,28 @@ int kvstore_service_maintain(kvstore_service_t *service)
         return -1;
     }
     (void)cache_maintain(service->cache, 64U, 16U);
+    (void)aof_maintain(service->aof);
     return 0;
+}
+
+int kvstore_service_flush(kvstore_service_t *service)
+{
+    if (service == NULL || !service->initialized) {
+        return -1;
+    }
+    if (aof_flush(service->aof) != 0 &&
+        !service->aof_flush_failure_reported) {
+        service->aof_flush_failure_reported = 1;
+        return -1;
+    }
+    return 0;
+}
+
+void kvstore_service_attach_aof(kvstore_service_t *service, aof_t *aof)
+{
+    if (service != NULL && service->initialized) {
+        service->aof = aof;
+    }
 }
 
 static int execute_set(kvstore_service_t *service,
@@ -195,6 +347,8 @@ static int execute_set(kvstore_service_t *service,
                        kvstore_reply_t *reply)
 {
     uint64_t ttl_ms = 0;
+    uint64_t expire_at_ms = 0;
+    uint64_t now;
     int result;
 
     if (argument_count == 5U) {
@@ -224,18 +378,28 @@ static int execute_set(kvstore_service_t *service,
             return 0;
         }
     }
-    result = cache_set(service->cache,
-                       arguments[1].data,
-                       arguments[1].length,
-                       arguments[2].data,
-                       arguments[2].length,
-                       ttl_ms);
+    now = cache_current_time_ms(service->cache);
+    if (ttl_ms != 0) {
+        if (ttl_ms > UINT64_MAX - now) {
+            set_error(reply, error_integer, sizeof(error_integer) - 1U);
+            return 0;
+        }
+        expire_at_ms = now + ttl_ms;
+    }
+    result = cache_set_expire_at(service->cache,
+                                 arguments[1].data,
+                                 arguments[1].length,
+                                 arguments[2].data,
+                                 arguments[2].length,
+                                 expire_at_ms);
     if (result == CACHE_SET_CAPACITY) {
         set_error(reply, error_capacity, sizeof(error_capacity) - 1U);
     } else if (result == CACHE_SET_RANGE) {
         set_error(reply, error_integer, sizeof(error_integer) - 1U);
     } else if (result != CACHE_SET_OK) {
         set_error(reply, error_internal, sizeof(error_internal) - 1U);
+    } else if (append_set_command(service, arguments, expire_at_ms) != 0) {
+        set_aof_error(reply);
     } else {
         set_data_reply(reply,
                        KVSTORE_REPLY_SIMPLE,
@@ -252,6 +416,7 @@ static int execute_expire(kvstore_service_t *service,
 {
     int64_t parsed;
     uint64_t ttl_ms = 0;
+    uint64_t deadline = 0;
     int parse_result;
     int result;
 
@@ -269,15 +434,30 @@ static int execute_expire(kvstore_service_t *service,
                               arguments[1].data,
                               arguments[1].length);
     } else {
-        result = cache_expire(service->cache,
-                              arguments[1].data,
-                              arguments[1].length,
-                              ttl_ms);
+        uint64_t now = cache_current_time_ms(service->cache);
+
+        if (ttl_ms > UINT64_MAX - now) {
+            set_error(reply, error_integer, sizeof(error_integer) - 1U);
+            return 0;
+        }
+        deadline = now + ttl_ms;
+        result = cache_expire_at(service->cache,
+                                 arguments[1].data,
+                                 arguments[1].length,
+                                 deadline);
     }
     if (result == -2) {
         set_error(reply, error_integer, sizeof(error_integer) - 1U);
     } else if (result < 0) {
         set_error(reply, error_internal, sizeof(error_internal) - 1U);
+    } else if (result > 0 &&
+               (parsed <= 0
+                    ? append_key_command(service, "DEL", &arguments[1])
+                    : append_deadline_command(service,
+                                              "PEXPIREAT",
+                                              &arguments[1],
+                                              deadline)) != 0) {
+        set_aof_error(reply);
     } else {
         set_integer(reply, result);
     }
@@ -365,6 +545,10 @@ int kvstore_service_execute(kvstore_service_t *service,
         set_error(reply, error_arity, sizeof(error_arity) - 1U);
         return 0;
     }
+    if (is_write_command(command) && aof_is_failed(service->aof)) {
+        set_aof_error(reply);
+        return 0;
+    }
 
     switch (command) {
     case SERVICE_COMMAND_SET:
@@ -385,6 +569,11 @@ int kvstore_service_execute(kvstore_service_t *service,
 
             if (deleted < 0) {
                 set_error(reply, error_internal, sizeof(error_internal) - 1U);
+            } else if (deleted > 0 &&
+                       append_key_command(service,
+                                          "DEL",
+                                          &arguments[1]) != 0) {
+                set_aof_error(reply);
             } else {
                 set_integer(reply, deleted);
             }
@@ -432,6 +621,11 @@ int kvstore_service_execute(kvstore_service_t *service,
 
             if (persisted < 0) {
                 set_error(reply, error_internal, sizeof(error_internal) - 1U);
+            } else if (persisted > 0 &&
+                       append_key_command(service,
+                                          "PERSIST",
+                                          &arguments[1]) != 0) {
+                set_aof_error(reply);
             } else {
                 set_integer(reply, persisted);
             }
@@ -446,4 +640,95 @@ int kvstore_service_execute(kvstore_service_t *service,
     default:
         return -1;
     }
+}
+
+static int replay_argument_equals(const aof_argument_t *argument,
+                                  const char *name)
+{
+    kvstore_argument_t service_argument;
+
+    service_argument.data = argument->data;
+    service_argument.length = argument->length;
+    return argument_equals(&service_argument, name);
+}
+
+int kvstore_service_replay_aof(const aof_argument_t *arguments,
+                               size_t argument_count,
+                               void *context)
+{
+    kvstore_service_t *service = context;
+    uint64_t now;
+    int result;
+
+    if (service == NULL || !service->initialized || arguments == NULL ||
+        argument_count == 0) {
+        return -1;
+    }
+    now = cache_current_time_ms(service->cache);
+    if (replay_argument_equals(&arguments[0], "SET")) {
+        uint64_t deadline = 0;
+
+        if (argument_count != 3U && argument_count != 5U) {
+            return -1;
+        }
+        if (argument_count == 5U) {
+            if (!replay_argument_equals(&arguments[3], "PXAT") ||
+                parse_uint64_bytes(arguments[4].data,
+                                   arguments[4].length,
+                                   &deadline) != 0 ||
+                deadline == 0) {
+                return -1;
+            }
+        }
+        if (deadline != 0 && deadline <= now) {
+            result = cache_delete(service->cache,
+                                  arguments[1].data,
+                                  arguments[1].length);
+            return result < 0 ? -1 : 0;
+        }
+        result = cache_set_expire_at(service->cache,
+                                     arguments[1].data,
+                                     arguments[1].length,
+                                     arguments[2].data,
+                                     arguments[2].length,
+                                     deadline);
+        return result == CACHE_SET_OK ? 0 : -1;
+    }
+    if (replay_argument_equals(&arguments[0], "DEL") &&
+        argument_count == 2U) {
+        result = cache_delete(service->cache,
+                              arguments[1].data,
+                              arguments[1].length);
+        return result < 0 ? -1 : 0;
+    }
+    if (replay_argument_equals(&arguments[0], "PERSIST") &&
+        argument_count == 2U) {
+        result = cache_persist(service->cache,
+                               arguments[1].data,
+                               arguments[1].length);
+        return result < 0 ? -1 : 0;
+    }
+    if (replay_argument_equals(&arguments[0], "PEXPIREAT") &&
+        argument_count == 3U) {
+        uint64_t deadline;
+
+        if (parse_uint64_bytes(arguments[2].data,
+                               arguments[2].length,
+                               &deadline) != 0 ||
+            deadline == 0) {
+            return -1;
+        }
+        if (deadline <= now) {
+            result = cache_delete(service->cache,
+                                  arguments[1].data,
+                                  arguments[1].length);
+        } else {
+            result = cache_expire_at(service->cache,
+                                     arguments[1].data,
+                                     arguments[1].length,
+                                     deadline);
+        }
+        return result < 0 ? -1 : 0;
+    }
+    return -1;
 }
