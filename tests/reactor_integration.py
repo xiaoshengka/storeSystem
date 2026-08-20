@@ -7,12 +7,12 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Sequence, Tuple, Union
+from typing import List, Sequence, Tuple, Union
 
 
 HOST = "127.0.0.1"
 PORT = 9096
-RespValue = Tuple[str, Union[bytes, int, None]]
+RespValue = Tuple[str, Union[bytes, int, None, List["RespValue"]]]
 
 
 def encode_command(*arguments: bytes) -> bytes:
@@ -68,6 +68,13 @@ class RespReader:
             payload = bytes(self.buffer[payload_start:payload_start + length])
             del self.buffer[:required]
             return "bulk", payload
+        if prefix == ord("*"):
+            line, end = self._line(1)
+            count = int(line)
+            if count < 0:
+                raise AssertionError("unexpected null RESP array")
+            del self.buffer[:end]
+            return "array", [self.read() for _ in range(count)]
         raise AssertionError(f"unexpected RESP response prefix: {prefix!r}")
 
 
@@ -128,7 +135,7 @@ def test_basic_and_binary() -> None:
     assert exchange([b"GET", b""]) == ("bulk", b"")
     assert exchange([b"UNKNOWN"]) == ("error", b"ERR unknown command")
     assert exchange([b"GET"]) == ("error", b"ERR wrong number of arguments")
-    assert exchange([b"HGET", b"key"]) == ("error", b"ERR unknown command")
+    assert exchange([b"HGET", b"missing", b"field"]) == ("bulk", None)
     assert exchange([b"PING"], half_close=True) == ("simple", b"PONG")
     assert exchange([b"SET", b"ttl-key", b"ttl-value", b"PX", b"500"]) == (
         "simple", b"OK"
@@ -142,6 +149,89 @@ def test_basic_and_binary() -> None:
     info = exchange([b"INFO", b"CACHE"])
     assert info[0] == "bulk" and isinstance(info[1], bytes)
     assert b"hits:" in info[1] and b"evicted_keys:" in info[1]
+
+
+def test_typed_collections() -> None:
+    hash_key = b"hash\x00key"
+    assert exchange([
+        b"HSET", hash_key, b"field\x00a", b"one", b"field-b", b"two"
+    ]) == ("integer", 2)
+    assert exchange([b"HSET", hash_key, b"field-b", b"updated"]) == (
+        "integer", 0
+    )
+    assert exchange([b"HGET", hash_key, b"field\x00a"]) == ("bulk", b"one")
+    assert exchange([b"HLEN", hash_key]) == ("integer", 2)
+    all_fields = exchange([b"HGETALL", hash_key])
+    assert all_fields[0] == "array"
+    flat = all_fields[1]
+    assert isinstance(flat, list) and len(flat) == 4
+    normalized = {
+        flat[index][1]: flat[index + 1][1]
+        for index in range(0, len(flat), 2)
+    }
+    assert normalized == {b"field\x00a": b"one", b"field-b": b"updated"}
+    assert exchange([b"GET", hash_key]) == (
+        "error", b"WRONGTYPE Operation against a key holding the wrong kind of value"
+    )
+    assert exchange([b"PEXPIRE", hash_key, b"5000"]) == ("integer", 1)
+    assert exchange([b"HSET", hash_key, b"ttl", b"kept"]) == ("integer", 1)
+    ttl = exchange([b"PTTL", hash_key])
+    assert ttl[0] == "integer" and isinstance(ttl[1], int) and ttl[1] > 0
+
+    zset_key = b"zset"
+    assert exchange([
+        b"ZADD", zset_key, b"2", b"same-b", b"1", b"first",
+        b"2", b"same-a"
+    ]) == ("integer", 3)
+    assert exchange([b"ZADD", zset_key, b"3.5", b"first"]) == ("integer", 0)
+    assert exchange([b"ZSCORE", zset_key, b"first"]) == ("bulk", b"3.5")
+    assert exchange([b"ZCARD", zset_key]) == ("integer", 3)
+    assert exchange([b"ZRANGE", zset_key, b"0", b"-1", b"WITHSCORES"]) == (
+        "array", [
+            ("bulk", b"same-a"), ("bulk", b"2"),
+            ("bulk", b"same-b"), ("bulk", b"2"),
+            ("bulk", b"first"), ("bulk", b"3.5"),
+        ]
+    )
+    assert exchange([b"ZADD", zset_key, b"nan", b"bad"]) == (
+        "error", b"ERR value is not a valid float"
+    )
+    assert exchange([b"ZREM", zset_key, b"same-a", b"missing"]) == (
+        "integer", 1
+    )
+    assert exchange([b"SET", zset_key, b"string-now"]) == ("simple", b"OK")
+    assert exchange([b"ZCARD", zset_key]) == (
+        "error", b"WRONGTYPE Operation against a key holding the wrong kind of value"
+    )
+    assert exchange([b"DEL", hash_key]) == ("integer", 1)
+    assert exchange([b"DEL", zset_key]) == ("integer", 1)
+
+
+def test_collection_response_limit() -> None:
+    key = b"large-hash-response"
+    value = b"v" * 8192
+    with connect() as client:
+        reader = RespReader(client)
+        for index in range(120):
+            client.sendall(encode_command(
+                b"HSET", key, f"field-{index:03d}".encode(), value
+            ))
+            assert reader.read() == ("integer", 1)
+        client.sendall(encode_command(b"HGETALL", key))
+        response = reader.read()
+        assert response[0] == "array" and isinstance(response[1], list)
+        assert len(response[1]) == 240
+        for index in range(120, 128):
+            client.sendall(encode_command(
+                b"HSET", key, f"field-{index:03d}".encode(), value
+            ))
+            assert reader.read() == ("integer", 1)
+        client.sendall(encode_command(b"HGETALL", key))
+        assert reader.read() == (
+            "error", b"ERR response exceeds 1 MiB limit"
+        )
+        client.sendall(encode_command(b"DEL", key))
+        assert reader.read() == ("integer", 1)
 
 
 def test_fragmentation_and_pipeline() -> None:
@@ -217,6 +307,8 @@ def test_protocol_failures() -> None:
 
 def run_tests() -> None:
     test_basic_and_binary()
+    test_typed_collections()
+    test_collection_response_limit()
     test_fragmentation_and_pipeline()
     test_large_pipeline_backpressure()
     test_concurrency()

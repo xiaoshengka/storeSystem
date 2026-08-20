@@ -13,6 +13,7 @@ LEGACY_ENGINE_SRCS := \
 	src/kvstore_rbtree.c \
 	src/kvstore_hash.c
 HASH_ENGINE_SRCS := src/kvstore_hash.c
+OBJECT_ENGINE_SRCS := src/engine/object.c
 CACHE_SRCS := src/cache/cache.c
 AOF_SRCS := src/persistence/aof.c
 LEGACY_SERVICE_SRCS := src/kvstore.c
@@ -35,7 +36,7 @@ LDLIBS += -pthread
 NET_SRCS := src/net/buffer.c src/net/reactor.c
 SERVER_SERVICE_SRCS := $(RESP_SERVICE_SRCS) $(CACHE_SRCS) $(AOF_SRCS)
 SERVER_PROTOCOL_SRCS := $(PROTOCOL_SRCS)
-SERVER_ENGINE_SRCS := $(HASH_ENGINE_SRCS)
+SERVER_ENGINE_SRCS := $(HASH_ENGINE_SRCS) $(OBJECT_ENGINE_SRCS)
 SERVER_TARGET := kvstore
 else
 $(error Unsupported NETWORK_BACKEND '$(NETWORK_BACKEND)'; use epoll or ntyco)
@@ -52,23 +53,26 @@ RESP_TEST_SRCS := tests/test_resp.c $(PROTOCOL_SRCS)
 RESP_TEST_OBJS := $(RESP_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
 HASH_TEST_SRCS := tests/test_hash.c $(HASH_ENGINE_SRCS)
 HASH_TEST_OBJS := $(HASH_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
-CACHE_TEST_SRCS := tests/test_cache.c $(CACHE_SRCS) $(HASH_ENGINE_SRCS)
+OBJECT_TEST_SRCS := tests/test_object.c $(OBJECT_ENGINE_SRCS) $(HASH_ENGINE_SRCS)
+OBJECT_TEST_OBJS := $(OBJECT_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
+CACHE_TEST_SRCS := tests/test_cache.c $(CACHE_SRCS) $(OBJECT_ENGINE_SRCS) $(HASH_ENGINE_SRCS)
 CACHE_TEST_OBJS := $(CACHE_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
-RESP_SERVICE_TEST_SRCS := tests/test_resp_service.c $(RESP_SERVICE_SRCS) $(CACHE_SRCS) $(AOF_SRCS) $(PROTOCOL_SRCS) $(HASH_ENGINE_SRCS)
+RESP_SERVICE_TEST_SRCS := tests/test_resp_service.c $(RESP_SERVICE_SRCS) $(CACHE_SRCS) $(AOF_SRCS) $(PROTOCOL_SRCS) $(OBJECT_ENGINE_SRCS) $(HASH_ENGINE_SRCS)
 RESP_SERVICE_TEST_OBJS := $(RESP_SERVICE_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
 AOF_TEST_SRCS := tests/test_aof.c $(AOF_SRCS) $(PROTOCOL_SRCS)
 AOF_TEST_OBJS := $(AOF_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
 LEGACY_CLIENT_OBJ := $(BUILD_DIR)/bench/legacy_client.o
 QPS_CLIENT_OBJ := $(BUILD_DIR)/bench/qps_client.o
 MIXED_QPS_CLIENT_OBJ := $(BUILD_DIR)/bench/mixed_qps_client.o
+COLLECTION_BENCH_CLIENT_OBJ := $(BUILD_DIR)/bench/collection_bench_client.o
 ALL_OBJS := $(SERVER_OBJS) $(BUFFER_TEST_OBJS) $(KV_TEST_OBJS) \
 	$(RESP_TEST_OBJS) $(HASH_TEST_OBJS) $(CACHE_TEST_OBJS) \
-	$(RESP_SERVICE_TEST_OBJS) $(AOF_TEST_OBJS) $(LEGACY_CLIENT_OBJ) \
-	$(QPS_CLIENT_OBJ) $(MIXED_QPS_CLIENT_OBJ)
+	$(OBJECT_TEST_OBJS) $(RESP_SERVICE_TEST_OBJS) $(AOF_TEST_OBJS) $(LEGACY_CLIENT_OBJ) \
+	$(QPS_CLIENT_OBJ) $(MIXED_QPS_CLIENT_OBJ) $(COLLECTION_BENCH_CLIENT_OBJ)
 
 .PHONY: all clean test integration-test benchmark-test asan valgrind valgrind-run ntyco
 
-all: $(SERVER_TARGET) legacy_client qps_client mixed_qps_client
+all: $(SERVER_TARGET) legacy_client qps_client mixed_qps_client collection_bench_client
 
 $(SERVER_TARGET): $(SERVER_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
@@ -86,6 +90,11 @@ mixed_qps_client: $(MIXED_QPS_CLIENT_OBJ)
 
 $(MIXED_QPS_CLIENT_OBJ): CFLAGS += -pthread
 
+collection_bench_client: $(COLLECTION_BENCH_CLIENT_OBJ)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS) -pthread
+
+$(COLLECTION_BENCH_CLIENT_OBJ): CFLAGS += -pthread
+
 test_buffer: $(BUFFER_TEST_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -98,6 +107,9 @@ test_resp: $(RESP_TEST_OBJS)
 test_hash: $(HASH_TEST_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+test_object: $(OBJECT_TEST_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 test_cache: $(CACHE_TEST_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -107,11 +119,12 @@ test_resp_service: $(RESP_SERVICE_TEST_OBJS)
 test_aof: $(AOF_TEST_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-test: test_buffer test_kvstore test_resp test_hash test_cache test_resp_service test_aof
+test: test_buffer test_kvstore test_resp test_hash test_object test_cache test_resp_service test_aof
 	./test_buffer
 	./test_kvstore
 	./test_resp
 	./test_hash
+	./test_object
 	./test_cache
 	./test_resp_service
 	./test_aof
@@ -121,7 +134,7 @@ integration-test: kvstore
 	KVSTORE_CACHE_SERVER_COMMAND="./kvstore --maxmemory 1MiB --maxkeys 2" python3 tests/cache_integration.py
 	python3 tests/aof_integration.py
 
-benchmark-test: kvstore mixed_qps_client
+benchmark-test: kvstore mixed_qps_client collection_bench_client
 	python3 tests/benchmark_smoke.py
 
 asan:
@@ -140,11 +153,12 @@ valgrind:
 	$(MAKE) clean
 	$(MAKE) valgrind-run
 
-valgrind-run: test_buffer test_kvstore test_resp test_hash test_cache test_resp_service test_aof kvstore
+valgrind-run: test_buffer test_kvstore test_resp test_hash test_object test_cache test_resp_service test_aof kvstore
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_buffer
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_kvstore
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_resp
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_hash
+	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_object
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_cache
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_resp_service
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_aof
@@ -170,4 +184,4 @@ $(BUILD_DIR)/%.o: %.c
 -include $(ALL_OBJS:.o=.d)
 
 clean:
-	rm -rf build kvstore kvstore-ntyco legacy_client qps_client mixed_qps_client test_buffer test_kvstore test_resp test_hash test_cache test_resp_service test_aof
+	rm -rf build kvstore kvstore-ntyco legacy_client qps_client mixed_qps_client collection_bench_client test_buffer test_kvstore test_resp test_hash test_object test_cache test_resp_service test_aof

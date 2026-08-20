@@ -2,9 +2,9 @@
 
 基于 Linux C、非阻塞 Socket 与单线程 epoll Reactor 的内存 KV 缓存服务。
 
-当前发布版本为 `v0.5.1`：在 v0.5.0 AOF 功能基础上加入可复用缓冲区、Pipeline
-批量 write 和 everysec 后台 fdatasync。NtyCo、Array 与 RBTree 仅作为历史或算法
-对照保留；AOF rewrite 不属于本阶段。
+当前发布版本为 `v0.6.0`：顶层动态 Hash keyspace 加入 String、Hash、ZSet 类型
+对象，ZSet 可选择 SkipList 或 RBTree 有序索引。
+NtyCo 与根目录旧 Array/RBTree 仍只作为历史路径保留；AOF rewrite 不属于本阶段。
 
 ## 架构
 
@@ -12,15 +12,16 @@
 Client
   -> epoll Reactor / timerfd 周期维护
   -> RESP2 增量解析与编码
-  -> SET/GET/DEL/TTL 命令服务
-  -> Cache（TTL 最小堆 + LRU 双向链表 + 统计）
-  -> 动态 Hash（双表渐进式 rehash）
+  -> String / Hash / ZSet 命令服务
+  -> Cache（顶层动态 Hash + TTL 最小堆 + LRU + 统计）
+  -> 类型对象（Hash；成员 Hash + SkipList/RBTree ZSet）
   -> AOF（RESP2 写命令 + 批量 write + 后台 everysec fsync + 启动回放）
 ```
 
 Reactor 负责连接、非阻塞收发、Pipeline 背压、周期回调和资源回收；协议层只处理
 RESP 字节帧；服务层负责命令语义；Cache 不依赖网络或 RESP；Hash 只负责二进制
-key 的索引。v0.5.1 AOF 设计见
+key 的索引。v0.6 集合设计见
+[`docs/typed-collections-v0.6.md`](docs/typed-collections-v0.6.md)；v0.5.1 AOF 设计见
 [`docs/aof-v0.5.1.md`](docs/aof-v0.5.1.md)；v0.4 Cache 设计见
 [`docs/cache-v0.4.md`](docs/cache-v0.4.md)。
 
@@ -40,6 +41,8 @@ make
 - `qps_client`：支持多连接和可配置 Pipeline 的 RESP2 GET 基准客户端。
 - `mixed_qps_client`：共享大 keyspace 的 90% GET / 10% SET、64B value
   混合基准客户端，可施加 TTL 和 LRU 容量压力。
+- `collection_bench_client`：同一 RESP2 C 客户端覆盖 Hash/ZSet 写入、命中读、
+  90% 读/10% 写和固定宽度 ZRANGE，可同时驱动本项目与 Redis。
 - `legacy_client`：旧文本协议历史客户端，不用于 epoll 主服务。
 
 ## 启动、容量与 AOF
@@ -48,6 +51,7 @@ make
 ./kvstore
 ./kvstore --maxmemory 64MiB
 ./kvstore --maxmemory 64MiB --maxkeys 100000
+./kvstore --zset-engine rbtree
 ./kvstore --appendonly yes --appendfilename appendonly.aof \
   --appendfsync everysec
 ```
@@ -57,6 +61,8 @@ make
 - `--maxkeys`：最大 key 数量，只接受无符号十进制整数。
 - 两个上限都可以使用，任一超限都会触发 LRU；`0` 表示不限制。
 - `--engine` 已移除，epoll 主服务固定使用 Hash。
+- `--zset-engine skiplist|rbtree`：选择所有 ZSet 的有序索引，默认 `skiplist`；
+  不改变顶层 keyspace 的 Hash 实现。
 - `--appendonly yes|no`：是否启用 AOF，默认 `no`。
 - `--appendfilename`：AOF 路径，默认 `appendonly.aof`。
 - `--appendfsync always|everysec|no`：每条写命令同步、约每秒同步或交给操作系统，
@@ -79,6 +85,7 @@ AOF 只记录实际改变 Cache 的写操作：
 
 - 成功的 `SET`；带 TTL 时内部规范化为绝对时间的 `SET ... PXAT`。
 - 成功的 `DEL` 和 `PERSIST`。
+- 实际改变集合的 `HSET/HDEL/ZADD/ZREM`，保留批量参数。
 - 成功的 `EXPIRE/PEXPIRE`，内部规范化为 `PEXPIREAT`；非正 TTL 导致的删除记录
   `DEL`。
 - `maxmemory/maxkeys` 触发的 LRU 淘汰记录显式 `DEL`。
@@ -111,20 +118,33 @@ AOF 只记录实际改变 Cache 的写操作：
 | `PERSIST key` | 清除 TTL | Integer `1` 或 `0` |
 | `INFO CACHE` | 查询缓存统计 | Bulk String |
 | `PING [message]` | 探活或回显 | Simple/Bulk String |
+| `HSET key field value [field value ...]` | 新增或更新 field | 新增 field 数 |
+| `HGET key field` | 查询 field | Bulk String 或 Null Bulk |
+| `HDEL key field [field ...]` | 删除 field | 删除 field 数 |
+| `HLEN key` | field 数 | Integer |
+| `HGETALL key` | 返回全部 field/value，顺序不保证 | Array of Bulk Strings |
+| `ZADD key score member [score member ...]` | 新增或更新 member | 新增 member 数 |
+| `ZREM key member [member ...]` | 删除 member | 删除 member 数 |
+| `ZSCORE key member` | 查询 score | Bulk String 或 Null Bulk |
+| `ZCARD key` | member 数 | Integer |
+| `ZRANGE key start stop [WITHSCORES]` | 按闭区间 rank 查询，支持负数 | Array of Bulk Strings |
 
 `TTL/PTTL` 对缺失或已过期 key 返回 `-2`，对永久 key 返回 `-1`。非正数
 `EXPIRE/PEXPIRE` 会立即删除现有 key；`SET EX/PX` 要求严格正整数。
+集合命令遇到其他类型返回 `WRONGTYPE`。HSET/ZADD 保留顶层 key 的已有 TTL；SET
+可覆盖集合并清除 TTL。批量命令中的重复 field/member 以最后一次出现为准。
 
 `INFO CACHE` 返回以下稳定字段：
 
 ```text
 keys used_memory index_memory maxmemory maxkeys
 hits misses hit_rate expired_keys evicted_keys
-hash_slots rehashing
+hash_slots rehashing string_keys hash_keys zset_keys
+hash_fields zset_members zset_engine
 ```
 
-只有 `GET` 参与 hit/miss 统计。惰性和主动删除都计入 `expired_keys`，容量驱逐才
-计入 `evicted_keys`。
+对象查找命令参与 hit/miss 统计。惰性和主动删除都计入 `expired_keys`，容量驱逐
+才计入 `evicted_keys`。
 
 ## 缓存行为
 
@@ -136,6 +156,8 @@ hash_slots rehashing
   触发一次主动过期，每次最多删除 64 个 key。
 - 单个条目超过 `maxmemory` 时，`SET` 返回 `ERR cache capacity exceeded`，已有值
   保持不变。
+- `maxkeys` 只统计顶层 key；集合的内部节点、字符串、桶和有序索引计入
+  `used_memory`。TTL、LRU 和淘汰作用于整个集合 key，不支持成员级 TTL。
 
 ## 测试
 
@@ -151,7 +173,8 @@ make valgrind
   精确 LRU、双容量限制、统计、服务命令、AOF 缓冲/编解码、后台同步和尾部修复。
 - 集成测试覆盖半包/粘包、Pipeline、背压、并发连接、二进制数据、half-close、
   协议错误、真实定时过期、小容量 LRU，以及 AOF 重启恢复、二进制 key/value 和
-  绝对 TTL、Pipeline 批量 write，以及成功响应后 SIGKILL 的启动恢复。
+  绝对 TTL、Pipeline 批量 write、集合命令、两种 ZSet 后端交叉恢复，以及成功响应
+  后 SIGKILL 的启动恢复。
 - `make asan` 使用 ASan/UBSan；`make valgrind` 检查单元与集成主路径。
 - `make benchmark-test` 对 AOF 重放脚本和可选延迟采样做小规模 smoke test，不是
   性能基线。
@@ -205,6 +228,73 @@ P99 应和以下指标一起判断：
   错误数、命中率、过期/淘汰增量，避免用降低吞吐换取表面上的低延迟。
 - P99 至少需要足够样本，并应执行多轮报告中位数和波动范围；当前客户端是闭环
   压测，会受到 coordinated omission 影响，不等价于固定到达率负载模型。
+
+### Redis 6.2.23 Hash/ZSet 对照
+
+先单独构建 Redis 6.2.23，并把 `redis-server` 路径传给脚本；仓库不包含 Redis
+源码或二进制。脚本用同一个 C 客户端运行本项目与 Redis：本项目 Hash workload
+只运行一次，ZSet workload 才分别运行 SkipList 和 RBTree；Redis 的 Hash/ZSet 各
+运行一次。CSV 中本项目 Hash 的 `target` 为 `hash`，不会再把 Hash 结果误标为两种
+ZSet 后端。Redis 禁用 RDB 和自动 AOF rewrite，并把 Hash/ZSet 紧凑编码阈值设为 0。
+等价的 Redis 6.2.23 配置为：
+
+```conf
+save ""
+hash-max-ziplist-entries 0
+zset-max-ziplist-entries 0
+auto-aof-rewrite-percentage 0
+```
+
+需要测试 AOF 时再设置 `appendonly yes` 与 `appendfsync no|everysec`。脚本直接通过
+命令行传入这些选项，命令行配置会覆盖 redis.conf 中的同名配置。
+
+`collection_bench_client -k/--keyspace` 表示读、混合和 ZRANGE workload 共享集合
+中的 field/member 总数，与连接数无关。例如 `-c 32 -k 100000` 是 32 个连接共同
+访问同一个包含 100,000 个 field/member 的 Hash/ZSet，并且只预加载一次。纯插入
+workload 从空集合开始，最终基数等于 `--requests`；各连接使用不重叠的全局请求
+编号，插入预热使用独立临时 key 并在计时前删除。客户端和 CSV 同时报告初始与预期
+最终 cardinality，避免把 `keyspace` 错解为每连接容量。
+
+`hash-mixed` 的 10% HSET 会保持 value 长度为 64B，但把前 16 字节改为该请求的
+十六进制序号，并用下一字节区分预热和计时阶段，确保计时写是更新已有 field 的真实
+数据修改，而不是把相同 value 重写一遍；这样本项目和 Redis 都承担对应的对象更新
+与 AOF 记录工作。
+
+先运行小规模 smoke：
+
+```bash
+make kvstore collection_bench_client
+python3 bench/redis_collection_compare.py \
+  --redis-server /usr/local/bin/redis-server \
+  --aof-policies off --repeats 1 \
+  --connections 4 --pipeline 8 \
+  --requests 10000 --keyspace 1000 \
+  --csv bench/results/redis-6.2.23-smoke.csv
+```
+
+确认本项目 Hash、两种 ZSet 后端和 Redis 的全部 workload 无错误后，再运行正式对照：
+
+```bash
+make kvstore collection_bench_client
+python3 bench/redis_collection_compare.py \
+  --redis-server /usr/local/bin/redis-server \
+  --repeats 5 --connections 32 --pipeline 16 \
+  --requests 1000000 --keyspace 100000 \
+  --csv bench/results/redis-6.2.23-collections.csv
+```
+
+默认对 AOF off 运行全部 workload，并对含写 workload 额外运行 `appendfsync no` 和
+`everysec`。CSV 包含 QPS、Mean/P50/P95/P99/P99.9/max、错误数、VmHWM、逻辑
+内存、AOF 大小、共享数据 key、初始/预期/实际 cardinality 和 keyspace 范围；每轮
+结束前会用 `HLEN/ZCARD` 校验实际 cardinality，不一致立即失败。脚本启动时校验 Redis 必须是
+6.2.23，每轮打印 START/DONE、QPS、错误数和耗时，并在每轮结束后立即 flush CSV，
+中断时已完成结果不会丢失。客户端使用确定性 seed；正式报告还必须记录 OS、CPU、
+内存、磁盘、编译选项、客户端/服务端位置和持续时间。本仓库不写入未经目标 Ubuntu
+环境实测的集合性能数字。
+
+`--targets skiplist,rbtree` 可用于不启动 Redis 的本项目 smoke；Hash 仍只运行一次，
+ZSet 分别运行两个后端。正式三方对照保持默认
+`--targets skiplist,rbtree,redis`，并必须提供 `--redis-server`。
 
 可以用脚本自动按相同参数比较 AOF 策略。脚本会为每轮使用独立 AOF，服务端与
 客户端均在本机，并输出每轮结果、多轮 QPS/P99 摘要和可选 CSV：

@@ -6,6 +6,13 @@
 typedef struct hashtable_s hashtable_t;
 typedef struct kv_hash_node kv_hash_node_t;
 
+typedef struct kv_hash_iterator {
+    hashtable_t *hash;
+    size_t table_index;
+    size_t bucket_index;
+    kv_hash_node_t *next;
+} kv_hash_iterator_t;
+
 typedef void (*kv_hash_payload_destroy_fn)(void *payload);
 
 int kv_hash_create(hashtable_t **out_hash);
@@ -35,5 +42,7 @@ size_t kv_hash_index_memory(const hashtable_t *hash);
 size_t kv_hash_node_memory_for_key(size_t key_length);
 int kv_hash_is_rehashing(const hashtable_t *hash);
 size_t kv_hash_rehash_step(hashtable_t *hash, size_t bucket_budget);
+void kv_hash_iterator_begin(hashtable_t *hash, kv_hash_iterator_t *iterator);
+kv_hash_node_t *kv_hash_iterator_next(kv_hash_iterator_t *iterator);
 
 #endif
