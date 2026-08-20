@@ -39,7 +39,7 @@ int main(void)
     static const unsigned char replacement[] = {'v', 0, '2', 0};
     fake_clock_t clock = {10000U};
     cache_config_t config = {0};
-    kvstore_argument_t arguments[5];
+    kvstore_argument_t arguments[8];
     kvstore_service_t service;
     kvstore_reply_t reply;
 
@@ -125,6 +125,71 @@ int main(void)
     reply = execute(&service, arguments, 2U);
     assert(reply.type == KVSTORE_REPLY_BULK && reply.length == sizeof(value));
 
+    arguments[0] = argument("HSET", 4);
+    arguments[1] = argument("hash", 4);
+    arguments[2] = argument("field-1", 7);
+    arguments[3] = argument("one", 3);
+    arguments[4] = argument("field-2", 7);
+    arguments[5] = argument("two", 3);
+    reply = execute(&service, arguments, 6U);
+    assert(reply.type == KVSTORE_REPLY_INTEGER && reply.integer == 2);
+    arguments[0] = argument("HGET", 4);
+    reply = execute(&service, arguments, 3U);
+    assert(reply.type == KVSTORE_REPLY_BULK && reply.length == 3U);
+    arguments[0] = argument("HLEN", 4);
+    reply = execute(&service, arguments, 2U);
+    assert(reply.integer == 2);
+    arguments[0] = argument("HGETALL", 7);
+    reply = execute(&service, arguments, 2U);
+    assert(reply.type == KVSTORE_REPLY_ARRAY && reply.element_count == 4U);
+    arguments[0] = argument("GET", 3);
+    reply = execute(&service, arguments, 2U);
+    assert(reply.type == KVSTORE_REPLY_ERROR);
+    arguments[0] = argument("EXPIRE", 6);
+    arguments[2] = argument("10", 2);
+    assert(execute(&service, arguments, 3U).integer == 1);
+    arguments[0] = argument("HSET", 4);
+    arguments[2] = argument("field-1", 7);
+    arguments[3] = argument("updated", 7);
+    assert(execute(&service, arguments, 4U).integer == 0);
+    arguments[0] = argument("PTTL", 4);
+    assert(execute(&service, arguments, 2U).integer == 10000);
+    arguments[0] = argument("HDEL", 4);
+    arguments[2] = argument("field-1", 7);
+    arguments[3] = argument("field-2", 7);
+    assert(execute(&service, arguments, 4U).integer == 2);
+    arguments[0] = argument("HLEN", 4);
+    assert(execute(&service, arguments, 2U).integer == 0);
+
+    arguments[0] = argument("ZADD", 4);
+    arguments[1] = argument("zset", 4);
+    arguments[2] = argument("2", 1);
+    arguments[3] = argument("two", 3);
+    arguments[4] = argument("1", 1);
+    arguments[5] = argument("one", 3);
+    assert(execute(&service, arguments, 6U).integer == 2);
+    arguments[0] = argument("ZSCORE", 6);
+    arguments[2] = argument("two", 3);
+    reply = execute(&service, arguments, 3U);
+    assert(reply.type == KVSTORE_REPLY_BULK &&
+           reply.length == 1U && reply.data[0] == '2');
+    arguments[0] = argument("ZRANGE", 6);
+    arguments[2] = argument("0", 1);
+    arguments[3] = argument("-1", 2);
+    reply = execute(&service, arguments, 4U);
+    assert(reply.type == KVSTORE_REPLY_ARRAY && reply.element_count == 2U);
+    assert(reply.elements[0].length == 3U &&
+           memcmp(reply.elements[0].data, "one", 3) == 0);
+    arguments[4] = argument("WITHSCORES", 10);
+    reply = execute(&service, arguments, 5U);
+    assert(reply.type == KVSTORE_REPLY_ARRAY && reply.element_count == 4U);
+    arguments[0] = argument("ZREM", 4);
+    arguments[2] = argument("one", 3);
+    arguments[3] = argument("two", 3);
+    assert(execute(&service, arguments, 4U).integer == 2);
+    arguments[0] = argument("ZCARD", 5);
+    assert(execute(&service, arguments, 2U).integer == 0);
+
     arguments[0] = argument("UNKNOWN", 7);
     reply = execute(&service, arguments, 1U);
     assert(reply.type == KVSTORE_REPLY_ERROR);
@@ -133,6 +198,28 @@ int main(void)
     assert(reply.type == KVSTORE_REPLY_ERROR);
 
     kvstore_service_destroy(&service);
+
+    {
+        kvstore_service_config_t service_config = {0};
+
+        service_config.cache = config;
+        service_config.zset_engine = KV_ZSET_RBTREE;
+        assert(kvstore_service_init_with_config(&service, &service_config) == 0);
+        arguments[0] = argument("ZADD", 4);
+        arguments[1] = argument("tree", 4);
+        arguments[2] = argument("3", 1);
+        arguments[3] = argument("three", 5);
+        arguments[4] = argument("1", 1);
+        arguments[5] = argument("one", 3);
+        assert(execute(&service, arguments, 6U).integer == 2);
+        arguments[0] = argument("ZRANGE", 6);
+        arguments[2] = argument("0", 1);
+        arguments[3] = argument("-1", 2);
+        reply = execute(&service, arguments, 4U);
+        assert(reply.type == KVSTORE_REPLY_ARRAY && reply.element_count == 2U);
+        assert(memcmp(reply.elements[0].data, "one", 3) == 0);
+        kvstore_service_destroy(&service);
+    }
     puts("test_resp_service: PASS");
     return 0;
 }

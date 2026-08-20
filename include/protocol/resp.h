@@ -55,5 +55,10 @@ int resp_encode_bulk_string(unsigned char *output,
 int resp_encode_null_bulk_string(unsigned char *output,
                                  size_t capacity,
                                  size_t *output_length);
+int resp_encode_bulk_array(unsigned char *output,
+                           size_t capacity,
+                           const resp_slice_t *elements,
+                           size_t element_count,
+                           size_t *output_length);
 
 #endif

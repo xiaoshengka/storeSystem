@@ -126,6 +126,12 @@ static void test_encoders(void)
 {
     unsigned char output[64];
     static const unsigned char binary[] = {'a', 0, 'b'};
+    static const unsigned char one[] = "one";
+    static const unsigned char two[] = {'t', 0, 'o'};
+    static const resp_slice_t elements[] = {
+        {one, sizeof(one) - 1U},
+        {two, sizeof(two)}
+    };
     size_t length;
 
     assert(resp_encode_simple_string(output, sizeof(output), "OK", &length) == 0);
@@ -145,6 +151,14 @@ static void test_encoders(void)
     assert(length == 6U && memcmp(output, "$0\r\n\r\n", length) == 0);
     assert(resp_encode_null_bulk_string(output, sizeof(output), &length) == 0);
     assert(length == 5U && memcmp(output, "$-1\r\n", length) == 0);
+    assert(resp_encode_bulk_array(output,
+                                  sizeof(output),
+                                  elements,
+                                  2U,
+                                  &length) == 0);
+    assert(length == 22U);
+    assert(memcmp(output, "*2\r\n$3\r\none\r\n$3\r\nt\000o\r\n", length) == 0);
+    assert(resp_encode_bulk_array(output, 8U, elements, 2U, &length) != 0);
 }
 
 int main(void)

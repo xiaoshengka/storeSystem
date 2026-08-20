@@ -29,6 +29,7 @@ static double elapsed_seconds(const struct timespec *start,
 
 typedef struct app_options {
     cache_config_t cache;
+    kv_zset_engine_t zset_engine;
     int appendonly;
     const char *appendfilename;
     aof_fsync_policy_t appendfsync;
@@ -85,6 +86,32 @@ static int encode_reply(const kvstore_reply_t *reply,
         return resp_encode_null_bulk_string(response,
                                             response_capacity,
                                             response_length);
+    case KVSTORE_REPLY_ARRAY:
+        {
+            int header_length;
+            size_t position;
+            size_t index;
+
+            header_length = snprintf((char *)response,
+                                     response_capacity,
+                                     "*%zu\r\n",
+                                     reply->element_count);
+            if (header_length < 0 ||
+                (size_t)header_length >= response_capacity) return -1;
+            position = (size_t)header_length;
+            for (index = 0; index < reply->element_count; ++index) {
+                size_t encoded = 0;
+
+                if (resp_encode_bulk_string(response + position,
+                                            response_capacity - position,
+                                            reply->elements[index].data,
+                                            reply->elements[index].length,
+                                            &encoded) != 0) return -1;
+                position += encoded;
+            }
+            *response_length = position;
+            return 0;
+        }
     default:
         return -1;
     }
@@ -226,10 +253,12 @@ static void print_usage(const char *program)
             "Usage: %s [--maxmemory SIZE] [--maxkeys COUNT]\n"
             "          [--appendonly yes|no] [--appendfilename PATH]\n"
             "          [--appendfsync always|everysec|no]\n"
+            "          [--zset-engine skiplist|rbtree]\n"
             "  SIZE accepts bytes or KiB/MiB/GiB suffixes; 0 means unlimited.\n"
             "  COUNT is an unsigned decimal integer; 0 means unlimited.\n"
             "  AOF defaults: appendonly=no, appendfilename=appendonly.aof,\n"
-            "                appendfsync=everysec.\n",
+            "                appendfsync=everysec.\n"
+            "  ZSet defaults: zset-engine=skiplist.\n",
             program);
 }
 
@@ -240,11 +269,13 @@ static int parse_options(int argc, char **argv, app_options_t *options)
     int saw_appendonly = 0;
     int saw_appendfilename = 0;
     int saw_appendfsync = 0;
+    int saw_zset_engine = 0;
     int index;
 
     memset(options, 0, sizeof(*options));
     options->appendfilename = "appendonly.aof";
     options->appendfsync = AOF_FSYNC_EVERYSEC;
+    options->zset_engine = KV_ZSET_SKIPLIST;
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
         print_usage(argv[0]);
         return 1;
@@ -298,6 +329,17 @@ static int parse_options(int argc, char **argv, app_options_t *options)
                 return -1;
             }
             saw_appendfsync = 1;
+        } else if (strcmp(argv[index], "--zset-engine") == 0 &&
+                   !saw_zset_engine) {
+            if (suffix_equals(argv[index + 1], "skiplist")) {
+                options->zset_engine = KV_ZSET_SKIPLIST;
+            } else if (suffix_equals(argv[index + 1], "rbtree")) {
+                options->zset_engine = KV_ZSET_RBTREE;
+            } else {
+                print_usage(argv[0]);
+                return -1;
+            }
+            saw_zset_engine = 1;
         } else {
             print_usage(argv[0]);
             return -1;
@@ -309,6 +351,7 @@ static int parse_options(int argc, char **argv, app_options_t *options)
 int main(int argc, char **argv)
 {
     app_options_t options;
+    kvstore_service_config_t service_config;
     kvstore_service_t service;
     reactor_t *reactor = NULL;
     aof_t *aof = NULL;
@@ -321,8 +364,11 @@ int main(int argc, char **argv)
     if (parse_result != 0) {
         return parse_result > 0 ? 0 : 2;
     }
-    if (kvstore_service_init(&service, &options.cache) != 0) {
-        fprintf(stderr, "failed to initialize Hash cache\n");
+    memset(&service_config, 0, sizeof(service_config));
+    service_config.cache = options.cache;
+    service_config.zset_engine = options.zset_engine;
+    if (kvstore_service_init_with_config(&service, &service_config) != 0) {
+        fprintf(stderr, "failed to initialize typed cache\n");
         return 1;
     }
     memset(&replay_stats, 0, sizeof(replay_stats));
@@ -388,9 +434,11 @@ int main(int argc, char **argv)
     }
 
     active_reactor = reactor;
-    printf("storeSystem v0.5.1 RESP reactor listening on port %u "
-           "(engine=hash, maxmemory=%zu, maxkeys=%zu, aof=%s, loaded=%zu)\n",
+    printf("storeSystem v0.6.0 RESP reactor listening on port %u "
+           "(keyspace=hash, zset=%s, maxmemory=%zu, maxkeys=%zu, "
+           "aof=%s, loaded=%zu)\n",
            DEFAULT_PORT,
+           kv_zset_engine_name(options.zset_engine),
            options.cache.max_memory,
            options.cache.max_keys,
            options.appendonly ? options.appendfilename : "off",

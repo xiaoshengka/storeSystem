@@ -13,6 +13,11 @@ typedef struct kvstore_service {
     int aof_flush_failure_reported;
     int initialized;
     unsigned char info_buffer[1024];
+    kv_zset_engine_t zset_engine;
+    struct kvstore_argument *reply_elements;
+    size_t reply_element_capacity;
+    unsigned char *reply_score_buffer;
+    size_t reply_score_capacity;
 } kvstore_service_t;
 
 typedef struct kvstore_argument {
@@ -25,7 +30,8 @@ typedef enum kvstore_reply_type {
     KVSTORE_REPLY_ERROR,
     KVSTORE_REPLY_INTEGER,
     KVSTORE_REPLY_BULK,
-    KVSTORE_REPLY_NULL_BULK
+    KVSTORE_REPLY_NULL_BULK,
+    KVSTORE_REPLY_ARRAY
 } kvstore_reply_type_t;
 
 typedef struct kvstore_reply {
@@ -33,10 +39,19 @@ typedef struct kvstore_reply {
     const unsigned char *data;
     size_t length;
     int64_t integer;
+    const kvstore_argument_t *elements;
+    size_t element_count;
 } kvstore_reply_t;
+
+typedef struct kvstore_service_config {
+    cache_config_t cache;
+    kv_zset_engine_t zset_engine;
+} kvstore_service_config_t;
 
 int kvstore_service_init(kvstore_service_t *service,
                          const cache_config_t *cache_config);
+int kvstore_service_init_with_config(kvstore_service_t *service,
+                                     const kvstore_service_config_t *config);
 void kvstore_service_destroy(kvstore_service_t *service);
 int kvstore_service_maintain(kvstore_service_t *service);
 int kvstore_service_flush(kvstore_service_t *service);

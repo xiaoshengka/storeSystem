@@ -419,6 +419,45 @@ size_t kv_hash_rehash_step(hashtable_t *hash, size_t bucket_budget)
     return moved;
 }
 
+void kv_hash_iterator_begin(hashtable_t *hash, kv_hash_iterator_t *iterator)
+{
+    if (iterator == NULL) {
+        return;
+    }
+    iterator->hash = hash;
+    iterator->table_index = 0;
+    iterator->bucket_index = 0;
+    iterator->next = NULL;
+}
+
+kv_hash_node_t *kv_hash_iterator_next(kv_hash_iterator_t *iterator)
+{
+    if (iterator == NULL || iterator->hash == NULL) {
+        return NULL;
+    }
+    if (iterator->next != NULL) {
+        kv_hash_node_t *result = iterator->next;
+
+        iterator->next = result->next;
+        return result;
+    }
+    while (iterator->table_index < 2U) {
+        kv_hash_table_t *table = &iterator->hash->tables[iterator->table_index];
+
+        while (iterator->bucket_index < table->slots) {
+            kv_hash_node_t *result = table->buckets[iterator->bucket_index++];
+
+            if (result != NULL) {
+                iterator->next = result->next;
+                return result;
+            }
+        }
+        iterator->table_index++;
+        iterator->bucket_index = 0;
+    }
+    return NULL;
+}
+
 static void legacy_value_destroy(void *payload)
 {
     legacy_value_t *value = payload;

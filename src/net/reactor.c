@@ -23,7 +23,7 @@
 #define REACTOR_IO_CHUNK 4096U
 #define REACTOR_INITIAL_BUFFER 512U
 #define REACTOR_MAX_REQUEST (64U * 1024U)
-#define REACTOR_MAX_RESPONSE (REACTOR_MAX_REQUEST + 64U)
+#define REACTOR_MAX_RESPONSE (1024U * 1024U)
 #define REACTOR_OUTPUT_HIGH_WATER (1024U * 1024U)
 
 enum reactor_source_kind {
@@ -62,6 +62,7 @@ struct reactor {
     reactor_flush_handler flush_handler;
     void *flush_context;
     reactor_connection_t *clients;
+    unsigned char *response_scratch;
 };
 
 static int set_nonblocking(int fd)
@@ -294,7 +295,7 @@ static int refresh_client_events(reactor_connection_t *connection)
 
 static int process_input(reactor_connection_t *connection)
 {
-    unsigned char response[REACTOR_MAX_RESPONSE];
+    unsigned char *response = connection->owner->response_scratch;
 
     while (net_buffer_readable(&connection->input) > 0 &&
            net_buffer_readable(&connection->output) < REACTOR_OUTPUT_HIGH_WATER &&
@@ -308,7 +309,7 @@ static int process_input(reactor_connection_t *connection)
             available,
             connection->peer_eof,
             response,
-            sizeof(response),
+            REACTOR_MAX_RESPONSE,
             &consumed,
             &response_length,
             &close_after_response,
@@ -322,7 +323,7 @@ static int process_input(reactor_connection_t *connection)
             break;
         }
         if (result != REACTOR_HANDLER_COMPLETE || consumed == 0 ||
-            consumed > available || response_length > sizeof(response)) {
+            consumed > available || response_length > REACTOR_MAX_RESPONSE) {
             errno = EPROTO;
             return -1;
         }
@@ -440,11 +441,17 @@ int reactor_init(reactor_t **out_reactor,
     if (reactor == NULL) {
         return -1;
     }
+    reactor->response_scratch = malloc(REACTOR_MAX_RESPONSE);
+    if (reactor->response_scratch == NULL) {
+        free(reactor);
+        return -1;
+    }
     reactor->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     reactor->port = port;
     reactor->handler = handler;
     reactor->handler_context = handler_context;
     if (reactor->epoll_fd < 0) {
+        free(reactor->response_scratch);
         free(reactor);
         return -1;
     }
@@ -659,5 +666,6 @@ void reactor_destroy(reactor_t *reactor)
         close(reactor->epoll_fd);
         reactor->epoll_fd = -1;
     }
+    free(reactor->response_scratch);
     free(reactor);
 }
