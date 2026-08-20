@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "engine/object.h"
+
 typedef struct cache cache_t;
 
 typedef uint64_t (*cache_now_ms_fn)(void *context);
@@ -30,6 +32,11 @@ typedef struct cache_stats {
     uint64_t evicted_keys;
     size_t hash_slots;
     int rehashing;
+    size_t string_keys;
+    size_t hash_keys;
+    size_t zset_keys;
+    size_t hash_fields;
+    size_t zset_members;
 } cache_stats_t;
 
 enum cache_set_result {
@@ -61,6 +68,20 @@ const void *cache_get(cache_t *cache,
                       const void *key,
                       size_t key_length,
                       size_t *value_length);
+kv_object_t *cache_get_object(cache_t *cache,
+                              const void *key,
+                              size_t key_length,
+                              int record_hit_or_miss);
+int cache_store_object(cache_t *cache,
+                       const void *key,
+                       size_t key_length,
+                       kv_object_t *object,
+                       uint64_t expire_at_ms,
+                       int preserve_existing_ttl);
+int cache_recharge_object(cache_t *cache,
+                          const void *key,
+                          size_t key_length);
+size_t cache_max_memory(const cache_t *cache);
 int cache_delete(cache_t *cache, const void *key, size_t key_length);
 int cache_expire(cache_t *cache,
                  const void *key,

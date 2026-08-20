@@ -263,3 +263,33 @@ int resp_encode_null_bulk_string(unsigned char *output,
     *output_length = sizeof(null_bulk) - 1U;
     return 0;
 }
+
+int resp_encode_bulk_array(unsigned char *output,
+                           size_t capacity,
+                           const resp_slice_t *elements,
+                           size_t element_count,
+                           size_t *output_length)
+{
+    int header_length;
+    size_t position;
+    size_t index;
+
+    if (output == NULL || output_length == NULL ||
+        (elements == NULL && element_count != 0)) return -1;
+    *output_length = 0;
+    header_length = snprintf((char *)output, capacity, "*%zu\r\n", element_count);
+    if (header_length < 0 || (size_t)header_length >= capacity) return -1;
+    position = (size_t)header_length;
+    for (index = 0; index < element_count; ++index) {
+        size_t encoded = 0;
+
+        if (resp_encode_bulk_string(output + position,
+                                    capacity - position,
+                                    elements[index].data,
+                                    elements[index].length,
+                                    &encoded) != 0) return -1;
+        position += encoded;
+    }
+    *output_length = position;
+    return 0;
+}

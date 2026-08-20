@@ -35,6 +35,7 @@ def start_server(
     aof_path: str,
     policy: str = "everysec",
     max_keys: int = 4,
+    zset_engine: str = "skiplist",
 ) -> subprocess.Popen:
     command = shlex.split(os.environ.get("KVSTORE_AOF_SERVER_PREFIX", "")) + [
         "./kvstore",
@@ -43,6 +44,7 @@ def start_server(
         "--appendfsync", policy,
         "--maxmemory", "4MiB",
         "--maxkeys", str(max_keys),
+        "--zset-engine", zset_engine,
     ]
     process = subprocess.Popen(
         command,
@@ -153,6 +155,51 @@ def verify_crash_batch_recovery(aof_path: str) -> None:
         stop_server(second)
 
 
+def verify_collection_cross_recovery(
+    aof_path: str,
+    writer_engine: str,
+    reader_engine: str,
+) -> None:
+    first = start_server(aof_path, "always", 64, writer_engine)
+    try:
+        with connect() as client:
+            reader = RespReader(client)
+            assert exchange(
+                reader, client, b"HSET", b"hash", b"a\x00f", b"one",
+                b"other", b"two"
+            ) == ("integer", 2)
+            assert exchange(
+                reader, client, b"ZADD", b"zset", b"2", b"member-b",
+                b"1", b"member-a", b"2", b"member-a2"
+            ) == ("integer", 3)
+            assert exchange(reader, client, b"PEXPIRE", b"hash", b"5000") == (
+                "integer", 1
+            )
+    finally:
+        stop_server(first)
+
+    second = start_server(aof_path, "always", 64, reader_engine)
+    try:
+        with connect() as client:
+            reader = RespReader(client)
+            assert exchange(reader, client, b"HGET", b"hash", b"a\x00f") == (
+                "bulk", b"one"
+            )
+            ttl = exchange(reader, client, b"PTTL", b"hash")
+            assert ttl[0] == "integer" and isinstance(ttl[1], int) and ttl[1] > 0
+            assert exchange(reader, client, b"ZCARD", b"zset") == ("integer", 3)
+            assert exchange(
+                reader, client, b"ZRANGE", b"zset", b"0", b"-1",
+                b"WITHSCORES"
+            ) == ("array", [
+                ("bulk", b"member-a"), ("bulk", b"1"),
+                ("bulk", b"member-a2"), ("bulk", b"2"),
+                ("bulk", b"member-b"), ("bulk", b"2"),
+            ])
+    finally:
+        stop_server(second)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="storeSystem-aof-") as directory:
         path = os.path.join(directory, "appendonly.aof")
@@ -168,6 +215,16 @@ def main() -> int:
         finally:
             stop_server(second)
         verify_crash_batch_recovery(os.path.join(directory, "crash.aof"))
+        verify_collection_cross_recovery(
+            os.path.join(directory, "skiplist-to-rbtree.aof"),
+            "skiplist",
+            "rbtree",
+        )
+        verify_collection_cross_recovery(
+            os.path.join(directory, "rbtree-to-skiplist.aof"),
+            "rbtree",
+            "skiplist",
+        )
     print("aof_integration: PASS")
     return 0
 

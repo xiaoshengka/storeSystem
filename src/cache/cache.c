@@ -19,9 +19,9 @@ enum removal_reason {
 };
 
 typedef struct cache_entry {
-    unsigned char *value;
-    size_t value_length;
+    kv_object_t *object;
     size_t memory_charge;
+    size_t object_items;
     uint64_t expire_at_ms;
     size_t heap_index;
     kv_hash_node_t *index_node;
@@ -44,6 +44,11 @@ struct cache {
     uint64_t misses;
     uint64_t expired_keys;
     uint64_t evicted_keys;
+    size_t string_keys;
+    size_t hash_keys;
+    size_t zset_keys;
+    size_t hash_fields;
+    size_t zset_members;
 };
 
 static int valid_bytes(const void *data, size_t length)
@@ -68,38 +73,59 @@ static uint64_t cache_now(const cache_t *cache)
     return cache->config.now_ms(cache->config.clock_context);
 }
 
-static unsigned char *copy_value(const void *value, size_t value_length)
+static size_t object_item_count(const kv_object_t *object)
 {
-    unsigned char *copy;
-
-    if (!valid_bytes(value, value_length) || value_length == SIZE_MAX) {
-        return NULL;
+    if (object == NULL) return 0;
+    if (kv_object_type(object) == KV_OBJECT_HASH) {
+        return kv_object_hash_length(object);
     }
-    copy = malloc(value_length + 1U);
-    if (copy == NULL) {
-        return NULL;
+    if (kv_object_type(object) == KV_OBJECT_ZSET) {
+        return kv_object_zset_length(object);
     }
-    if (value_length > 0) {
-        memcpy(copy, value, value_length);
-    }
-    copy[value_length] = '\0';
-    return copy;
+    return 0;
 }
 
-static size_t entry_memory_charge(size_t key_length, size_t value_length)
+static size_t entry_memory_charge(size_t key_length, const kv_object_t *object)
 {
     size_t node_charge = kv_hash_node_memory_for_key(key_length);
-    size_t value_charge;
+    size_t object_charge = kv_object_memory_usage(object);
 
-    if (node_charge == SIZE_MAX || value_length == SIZE_MAX) {
+    if (node_charge == SIZE_MAX || object == NULL) {
         return SIZE_MAX;
     }
-    value_charge = value_length + 1U;
     if (sizeof(cache_entry_t) > SIZE_MAX - node_charge ||
-        value_charge > SIZE_MAX - sizeof(cache_entry_t) - node_charge) {
+        object_charge > SIZE_MAX - sizeof(cache_entry_t) - node_charge) {
         return SIZE_MAX;
     }
-    return sizeof(cache_entry_t) + node_charge + value_charge;
+    return sizeof(cache_entry_t) + node_charge + object_charge;
+}
+
+static void stats_add_object(cache_t *cache,
+                             const kv_object_t *object,
+                             size_t items)
+{
+    if (kv_object_type(object) == KV_OBJECT_STRING) cache->string_keys++;
+    else if (kv_object_type(object) == KV_OBJECT_HASH) {
+        cache->hash_keys++;
+        cache->hash_fields += items;
+    } else {
+        cache->zset_keys++;
+        cache->zset_members += items;
+    }
+}
+
+static void stats_remove_object(cache_t *cache,
+                                const kv_object_t *object,
+                                size_t items)
+{
+    if (kv_object_type(object) == KV_OBJECT_STRING) cache->string_keys--;
+    else if (kv_object_type(object) == KV_OBJECT_HASH) {
+        cache->hash_keys--;
+        cache->hash_fields -= items;
+    } else {
+        cache->zset_keys--;
+        cache->zset_members -= items;
+    }
 }
 
 static int heap_less(const cache_entry_t *left, const cache_entry_t *right)
@@ -284,7 +310,8 @@ static void entry_remove(cache_t *cache,
     } else if (reason == REMOVE_EVICTED) {
         cache->evicted_keys++;
     }
-    free(entry->value);
+    stats_remove_object(cache, entry->object, entry->object_items);
+    kv_object_destroy(entry->object);
     free(entry);
 }
 
@@ -380,38 +407,36 @@ void cache_set_eviction_callback(cache_t *cache,
     }
 }
 
-int cache_set_expire_at(cache_t *cache,
-                        const void *key,
-                        size_t key_length,
-                        const void *value,
-                        size_t value_length,
-                        uint64_t expire_at_ms)
+int cache_store_object(cache_t *cache,
+                       const void *key,
+                       size_t key_length,
+                       kv_object_t *object,
+                       uint64_t expire_at_ms,
+                       int preserve_existing_ttl)
 {
     cache_entry_t *entry;
-    unsigned char *replacement;
     uint64_t now;
     uint64_t expire_at = expire_at_ms;
     size_t new_charge;
+    size_t new_items;
 
-    if (cache == NULL || !valid_bytes(key, key_length) ||
-        !valid_bytes(value, value_length)) {
+    if (cache == NULL || !valid_bytes(key, key_length) || object == NULL) {
         return CACHE_SET_ERROR;
     }
     now = cache_now(cache);
-    new_charge = entry_memory_charge(key_length, value_length);
+    new_charge = entry_memory_charge(key_length, object);
+    new_items = object_item_count(object);
     if (new_charge == SIZE_MAX ||
         (cache->config.max_memory != 0 &&
          new_charge > cache->config.max_memory)) {
         return CACHE_SET_CAPACITY;
     }
     entry = find_live(cache, key, key_length, now);
-    replacement = copy_value(value, value_length);
-    if (replacement == NULL) {
-        return CACHE_SET_ERROR;
+    if (entry != NULL && preserve_existing_ttl) {
+        expire_at = entry->expire_at_ms;
     }
     if (expire_at != 0 && entry != NULL && entry->expire_at_ms == 0 &&
         heap_reserve(cache, cache->heap_count + 1U) != 0) {
-        free(replacement);
         return CACHE_SET_ERROR;
     }
 
@@ -424,10 +449,7 @@ int cache_set_expire_at(cache_t *cache,
                                projected_memory)) {
             cache_entry_t *candidate = eviction_candidate(cache, entry);
 
-            if (candidate == NULL) {
-                free(replacement);
-                return CACHE_SET_CAPACITY;
-            }
+            if (candidate == NULL) return CACHE_SET_CAPACITY;
             projected_memory -= candidate->memory_charge;
             entry_remove(cache,
                          candidate,
@@ -439,9 +461,11 @@ int cache_set_expire_at(cache_t *cache,
 
         cache->used_memory = cache->used_memory - entry->memory_charge +
                              new_charge;
-        free(entry->value);
-        entry->value = replacement;
-        entry->value_length = value_length;
+        stats_remove_object(cache, entry->object, entry->object_items);
+        kv_object_destroy(entry->object);
+        entry->object = object;
+        entry->object_items = new_items;
+        stats_add_object(cache, object, new_items);
         entry->memory_charge = new_charge;
         if (entry->expire_at_ms != 0 && expire_at == 0) {
             heap_remove_at(cache, entry->heap_index);
@@ -459,16 +483,12 @@ int cache_set_expire_at(cache_t *cache,
 
     if (expire_at != 0 &&
         heap_reserve(cache, cache->heap_count + 1U) != 0) {
-        free(replacement);
         return CACHE_SET_ERROR;
     }
     entry = calloc(1, sizeof(*entry));
-    if (entry == NULL) {
-        free(replacement);
-        return CACHE_SET_ERROR;
-    }
-    entry->value = replacement;
-    entry->value_length = value_length;
+    if (entry == NULL) return CACHE_SET_ERROR;
+    entry->object = object;
+    entry->object_items = new_items;
     entry->memory_charge = new_charge;
     entry->expire_at_ms = expire_at;
     entry->heap_index = CACHE_HEAP_NONE;
@@ -477,22 +497,28 @@ int cache_set_expire_at(cache_t *cache,
                        key_length,
                        entry,
                        &entry->index_node) != 0) {
-        free(entry->value);
         free(entry);
         return CACHE_SET_ERROR;
     }
+    stats_add_object(cache, object, new_items);
     lru_link_head(cache, entry);
     cache->used_memory += new_charge;
-    if (expire_at != 0) {
-        heap_insert_reserved(cache, entry);
-    }
+    if (expire_at != 0) heap_insert_reserved(cache, entry);
     while (limits_exceeded(cache,
                            kv_hash_count(cache->index),
                            cache->used_memory)) {
         cache_entry_t *candidate = eviction_candidate(cache, entry);
 
         if (candidate == NULL) {
-            entry_remove(cache, entry, REMOVE_NORMAL);
+            entry->object = NULL;
+            stats_remove_object(cache, object, new_items);
+            if (entry->heap_index != CACHE_HEAP_NONE) {
+                heap_remove_at(cache, entry->heap_index);
+            }
+            lru_unlink(cache, entry);
+            (void)kv_hash_remove_node(cache->index, entry->index_node);
+            cache->used_memory -= entry->memory_charge;
+            free(entry);
             return CACHE_SET_CAPACITY;
         }
         entry_remove(cache,
@@ -502,6 +528,30 @@ int cache_set_expire_at(cache_t *cache,
                          : REMOVE_EVICTED);
     }
     return CACHE_SET_OK;
+}
+
+int cache_set_expire_at(cache_t *cache,
+                        const void *key,
+                        size_t key_length,
+                        const void *value,
+                        size_t value_length,
+                        uint64_t expire_at_ms)
+{
+    kv_object_t *object;
+    int result;
+
+    if (!valid_bytes(value, value_length) ||
+        kv_object_create_string(&object, value, value_length) != 0) {
+        return CACHE_SET_ERROR;
+    }
+    result = cache_store_object(cache,
+                                key,
+                                key_length,
+                                object,
+                                expire_at_ms,
+                                0);
+    if (result != CACHE_SET_OK) kv_object_destroy(object);
+    return result;
 }
 
 int cache_set(cache_t *cache,
@@ -528,29 +578,83 @@ int cache_set(cache_t *cache,
                                ttl_ms == 0 ? 0 : now + ttl_ms);
 }
 
+kv_object_t *cache_get_object(cache_t *cache,
+                              const void *key,
+                              size_t key_length,
+                              int record_hit_or_miss)
+{
+    cache_entry_t *entry;
+
+    if (cache == NULL || !valid_bytes(key, key_length)) return NULL;
+    entry = find_live(cache, key, key_length, cache_now(cache));
+    if (entry == NULL) {
+        if (record_hit_or_miss) cache->misses++;
+        return NULL;
+    }
+    if (record_hit_or_miss) cache->hits++;
+    lru_touch(cache, entry);
+    return entry->object;
+}
+
 const void *cache_get(cache_t *cache,
                       const void *key,
                       size_t key_length,
                       size_t *value_length)
 {
-    cache_entry_t *entry;
+    kv_object_t *object;
 
-    if (value_length == NULL) {
-        return NULL;
-    }
+    if (value_length == NULL) return NULL;
     *value_length = 0;
-    if (cache == NULL || !valid_bytes(key, key_length)) {
-        return NULL;
+    object = cache_get_object(cache, key, key_length, 1);
+    return kv_object_string_value(object, value_length);
+}
+
+int cache_recharge_object(cache_t *cache,
+                          const void *key,
+                          size_t key_length)
+{
+    cache_entry_t *entry;
+    size_t new_charge;
+    size_t new_items;
+    size_t projected;
+    uint64_t now;
+
+    if (cache == NULL || !valid_bytes(key, key_length)) return CACHE_SET_ERROR;
+    now = cache_now(cache);
+    entry = find_live(cache, key, key_length, now);
+    if (entry == NULL) return CACHE_SET_ERROR;
+    new_charge = entry_memory_charge(key_length, entry->object);
+    if (new_charge == SIZE_MAX ||
+        (cache->config.max_memory != 0 &&
+         new_charge > cache->config.max_memory)) return CACHE_SET_CAPACITY;
+    projected = cache->used_memory - entry->memory_charge + new_charge;
+    while (limits_exceeded(cache, kv_hash_count(cache->index), projected)) {
+        cache_entry_t *candidate = eviction_candidate(cache, entry);
+
+        if (candidate == NULL) return CACHE_SET_CAPACITY;
+        projected -= candidate->memory_charge;
+        entry_remove(cache,
+                     candidate,
+                     candidate->expire_at_ms != 0 && now >= candidate->expire_at_ms
+                         ? REMOVE_EXPIRED
+                         : REMOVE_EVICTED);
     }
-    entry = find_live(cache, key, key_length, cache_now(cache));
-    if (entry == NULL) {
-        cache->misses++;
-        return NULL;
+    new_items = object_item_count(entry->object);
+    if (kv_object_type(entry->object) == KV_OBJECT_HASH) {
+        cache->hash_fields = cache->hash_fields - entry->object_items + new_items;
+    } else if (kv_object_type(entry->object) == KV_OBJECT_ZSET) {
+        cache->zset_members = cache->zset_members - entry->object_items + new_items;
     }
-    cache->hits++;
+    entry->object_items = new_items;
+    cache->used_memory = projected;
+    entry->memory_charge = new_charge;
     lru_touch(cache, entry);
-    *value_length = entry->value_length;
-    return entry->value;
+    return CACHE_SET_OK;
+}
+
+size_t cache_max_memory(const cache_t *cache)
+{
+    return cache == NULL ? 0 : cache->config.max_memory;
 }
 
 int cache_delete(cache_t *cache, const void *key, size_t key_length)
@@ -709,6 +813,11 @@ void cache_get_stats(const cache_t *cache, cache_stats_t *stats)
     stats->evicted_keys = cache->evicted_keys;
     stats->hash_slots = kv_hash_slot_count(cache->index);
     stats->rehashing = kv_hash_is_rehashing(cache->index);
+    stats->string_keys = cache->string_keys;
+    stats->hash_keys = cache->hash_keys;
+    stats->zset_keys = cache->zset_keys;
+    stats->hash_fields = cache->hash_fields;
+    stats->zset_members = cache->zset_members;
 }
 
 uint64_t cache_current_time_ms(const cache_t *cache)
