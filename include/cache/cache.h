@@ -83,6 +83,12 @@ kv_object_t *cache_get_object_ref(cache_t *cache,
                                   size_t key_length,
                                   int record_hit_or_miss,
                                   cache_entry_ref_t **entry_ref);
+kv_object_t *cache_get_hash_object_ref(
+    cache_t *cache,
+    const void *key,
+    size_t key_length,
+    int record_hit_or_miss,
+    cache_entry_ref_t **entry_ref);
 int cache_store_object(cache_t *cache,
                        const void *key,
                        size_t key_length,

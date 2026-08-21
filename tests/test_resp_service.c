@@ -228,6 +228,15 @@ int main(void)
     reply = execute(&service, arguments, 3U);
     assert(reply.type == KVSTORE_REPLY_BULK &&
            reply.length == 1U && reply.data[0] == '2');
+    arguments[0] = argument("ZADD", 4);
+    arguments[2] = argument("1.5", 3);
+    arguments[3] = argument("two", 3);
+    assert(execute(&service, arguments, 4U).integer == 0);
+    arguments[0] = argument("ZSCORE", 6);
+    arguments[2] = argument("two", 3);
+    reply = execute(&service, arguments, 3U);
+    assert(reply.type == KVSTORE_REPLY_BULK && reply.length == 3U &&
+           memcmp(reply.data, "1.5", 3) == 0);
     arguments[0] = argument("ZRANGE", 6);
     arguments[2] = argument("0", 1);
     arguments[3] = argument("-1", 2);

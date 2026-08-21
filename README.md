@@ -2,7 +2,7 @@
 
 基于 Linux C、非阻塞 Socket 与单线程 epoll Reactor 的内存 KV 缓存服务。
 
-当前开发版本为 `v0.6.2`：新增项目原生 RDB、同步 `SAVE`、fork 子进程异步
+当前发布版本为 `v0.6.2`：新增项目原生 RDB、同步 `SAVE`、fork 子进程异步
 `BGSAVE`、自动快照以及 RDB+AOF 检查点尾部恢复。网络仍是单线程 epoll Reactor；
 后台执行单元只有 AOF writer 和 BGSAVE 子进程，不引入 io_uring。
 
@@ -29,8 +29,9 @@ key 的索引。v0.6.2 设计与验收口径见
 [`docs/cache-v0.4.md`](docs/cache-v0.4.md)。
 
 v0.6.1 的 64B Hash/ZSet mixed 长测、Redis 6.2.23 对照和发布门槛状态见
-[`docs/v0.6.1-performance-report.md`](docs/v0.6.1-performance-report.md)。当前
-纯内存 QPS 和 ZSet everysec P99 仍未达到既定门槛，因此版本仍处于开发状态。
+[`docs/v0.6.1-performance-report.md`](docs/v0.6.1-performance-report.md)。v0.6.2
+的测试汇总与已知性能偏差记录在下文；本次发布接受 Hash P16 QPS 和部分 AOF
+相对开销未达到原定严格门槛，不将这些偏差描述为已经通过。
 
 ## 环境与构建
 
@@ -339,6 +340,118 @@ SkipList，然后严格检查项目 QPS/P99 与 everysec 相对损失。客户�
 内存、磁盘、编译选项、客户端/服务端位置和持续时间。本仓库不写入未经目标 Ubuntu
 环境实测的集合性能数字。
 
+### v0.6.2 验收结果与发布决定
+
+本次正式汇总固定 32 连接、100,000 keyspace、64B payload、90% 读/10% 写、
+10,000,000 请求，并对每个单元执行 5 轮取中位数。P16/P64 覆盖 AOF off、
+everysec 和 everysec+BGSAVE。结果文件位于：
+
+- [`bench/result/v0.6.2-redis-6.2.23.csv.summary.csv`](bench/result/v0.6.2-redis-6.2.23.csv.summary.csv)
+- [`bench/result/v0.6.2-gate.json`](bench/result/v0.6.2-gate.json)
+- [`bench/result/aof-latency.csv`](bench/result/aof-latency.csv)
+- [`bench/result/aof-replay.csv.summary.csv`](bench/result/aof-replay.csv.summary.csv)
+
+42 个 Redis 对照汇总组的 QPS CV 全部低于 5%，最高约 2.06%；错误总数为 0，
+最终 cardinality 均为 100,000，BGSAVE 生成的 RDB 也都恢复到 100,000。
+18 个胜出后端发布对照单元中 15 个通过：String 和 ZSet 的 P16/P64 全部不劣于
+Redis，Hash P64 全部通过，三个失败单元均集中在 Hash P16 QPS。下表中的 P99
+优势为项目相对 Redis 的降低比例，正值代表项目更低。
+
+| 工作负载 | Pipeline | 策略/场景 | 项目 QPS | Redis QPS | QPS 差异 | 项目 P99 | Redis P99 | P99 优势 | 对照结果 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| String | 16 | off | 803,838 | 737,308 | +9.02% | 965 μs | 1,308 μs | 26.22% | 通过 |
+| String | 16 | everysec | 745,724 | 697,389 | +6.93% | 847 μs | 1,377 μs | 38.50% | 通过 |
+| String | 16 | everysec+BGSAVE | 750,896 | 693,495 | +8.28% | 852 μs | 1,381 μs | 38.27% | 通过 |
+| String | 64 | off | 1,869,994 | 1,503,829 | +24.35% | 1,681 μs | 2,474 μs | 32.08% | 通过 |
+| String | 64 | everysec | 1,767,973 | 1,405,998 | +25.75% | 1,442 μs | 2,661 μs | 45.82% | 通过 |
+| String | 64 | everysec+BGSAVE | 1,738,315 | 1,392,234 | +24.86% | 1,579 μs | 2,698 μs | 41.49% | 通过 |
+| Hash | 16 | off | 813,652 | 835,321 | -2.59% | 984 μs | 1,054 μs | 6.58% | **QPS 未通过** |
+| Hash | 16 | everysec | 717,059 | 775,495 | -7.54% | 1,110 μs | 1,125 μs | 1.31% | **QPS 未通过** |
+| Hash | 16 | everysec+BGSAVE | 723,447 | 774,666 | -6.61% | 1,106 μs | 1,132 μs | 2.24% | **QPS 未通过** |
+| Hash | 64 | off | 1,301,317 | 1,191,994 | +9.17% | 2,645 μs | 3,722 μs | 28.94% | 通过 |
+| Hash | 64 | everysec | 1,225,108 | 1,166,463 | +5.03% | 2,802 μs | 3,991 μs | 29.80% | 通过 |
+| Hash | 64 | everysec+BGSAVE | 1,207,517 | 1,166,533 | +3.51% | 2,823 μs | 3,966 μs | 28.81% | 通过 |
+| ZSet | 16 | off | 740,988 | 631,443 | +17.35% | 1,002 μs | 1,308 μs | 23.43% | 通过 |
+| ZSet | 16 | everysec | 731,462 | 626,360 | +16.78% | 1,277 μs | 1,299 μs | 1.70% | 通过 |
+| ZSet | 16 | everysec+BGSAVE | 720,855 | 624,108 | +15.50% | 1,291 μs | 1,302 μs | 0.81% | 通过 |
+| ZSet | 64 | off | 1,373,888 | 948,234 | +44.89% | 2,787 μs | 3,667 μs | 23.99% | 通过 |
+| ZSet | 64 | everysec | 1,370,832 | 935,251 | +46.57% | 2,997 μs | 3,721 μs | 19.46% | 通过 |
+| ZSet | 64 | everysec+BGSAVE | 1,370,283 | 938,899 | +45.95% | 2,928 μs | 3,718 μs | 21.25% | 通过 |
+
+ZSet 的四组 P16/P64、off/everysec 几何平均 QPS 为 SkipList 1,005,159、RBTree
+999,317，SkipList 领先约 0.58%。差异不超过 1%，因此按预定规则继续使用
+SkipList 作为默认后端。
+
+严格门禁 JSON 的最终状态仍为 `passed: false`。除三个 Hash P16 Redis 对照外，
+项目自身 everysec 相对 off 还有以下六项偏差：
+
+| 内部门槛偏差 | 实测 | 原门槛 |
+| --- | ---: | ---: |
+| String P16 everysec QPS 损失 | 7.23% | ≤ 5% |
+| String P64 everysec QPS 损失 | 5.46% | ≤ 5% |
+| Hash P16 everysec QPS 损失 | 11.87% | ≤ 5% |
+| Hash P16 everysec P99 增长 | 12.76% | ≤ 10% |
+| Hash P64 everysec QPS 损失 | 5.86% | ≤ 5% |
+| ZSet P16 everysec P99 增长 | 27.46% | ≤ 10% |
+
+这些偏差被明确接受为 v0.6.2 的已知限制：版本按功能完整性、正确性、资源检查、
+15/18 Redis 对照通过以及 BGSAVE/恢复结果发布，不把 `passed: false` 改写为通过；
+Hash P16 和 AOF 尾延迟继续作为后续性能债务。
+
+#### BGSAVE 影响
+
+相对普通 everysec，BGSAVE 期间的项目 QPS 变化为 +0.89% 到 -1.68%，P99 大多在
+±2.3% 内；String P64 P99 增长 9.48%，仍低于 10%。fork 暂停为 2.5–9.3 ms，
+后台快照持续 339–665 ms，所有单元无客户端错误、无 major fault 且恢复基数正确。
+
+| 类型 | Pipeline | BGSAVE QPS 变化 | P99 变化 | fork 暂停 | 快照持续时间 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| String | 16 | +0.69% | +0.68% | 2.500 ms | 605 ms |
+| String | 64 | -1.68% | +9.48% | 2.979 ms | 665 ms |
+| Hash | 16 | +0.89% | -0.31% | 7.886 ms | 479 ms |
+| Hash | 64 | -1.44% | +0.76% | 9.316 ms | 522 ms |
+| ZSet SkipList | 16 | -1.45% | +1.16% | 5.112 ms | 339 ms |
+| ZSet SkipList | 64 | -0.04% | -2.29% | 4.173 ms | 402 ms |
+
+#### AOF 在线吞吐与延迟
+
+AOF 在线测试同样使用 32 连接、Pipeline 16、100,000 keyspace、64B value、
+10,000,000 请求和 5 轮。1.5 亿计时请求全部完成，GET 命中率为 100%，SET 错误
+为 0；`no` 与 `everysec` 每轮生成相同的 134,366,493-byte AOF。
+
+| AOF 策略 | QPS 中位数 | QPS CV | 相对 off | P50 | P99 | P99.9 | 单轮最大延迟中位数 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| off | 804,711 | 0.66% | — | 610 μs | 956 μs | 1,081 μs | 3.16 ms |
+| no | 756,258 | 0.66% | -6.02% | 670 μs | 824 μs | 1,001 μs | 3.15 ms |
+| everysec | 749,211 | 0.48% | -6.90% | 669 μs | 865 μs | 1,409 μs | 18.14 ms |
+
+everysec 相对 no 只再损失约 0.93% QPS，主要固定成本来自 AOF 编码、writer 往返
+和响应屏障。everysec 的最大延迟中位数约为 off 的 5.7 倍，且五轮最大值均落在
+13.8–23.7 ms，说明周期同步仍会形成极端长尾。P99 低于 off 不代表持久化降低了
+服务时间，因为当前 Pipeline 延迟包含批次排队和响应顺序；应结合 P50、P99.9、
+max 与 `INFO PERSISTENCE` 的 fdatasync 统计判断。
+
+#### AOF 回放
+
+回放摘要把第一轮单列为 `first`，后四轮列为 `subsequent`。项目在全部 String、
+Hash、ZSet 和 10k/100k/1m 规模上都快于 Redis；以下为 1,000,000 命令后四轮
+中位数。
+
+| 类型/后端 | 项目回放 | Redis 回放 | 相对 Redis |
+| --- | ---: | ---: | ---: |
+| String | 0.426 s | 0.744 s | 1.75× |
+| Hash | 0.383 s | 0.884 s | 2.31× |
+| ZSet SkipList | 0.533 s | 1.038 s | 1.94× |
+| ZSet RBTree | 0.577 s | 1.038 s | 1.80× |
+
+各规模项目相对 Redis 的回放加速约为 1.75×–2.68×。ZSet 首轮 10k 时 RBTree
+更快，但 100k/1m 以及后续轮次总体由 SkipList 占优。部分后四轮 CV 超过 5%，
+最高约 9.84%，因此回放数据用于阶段结论，不作为 v0.6.2 严格门禁。
+
+结果文件本身没有嵌入完整 CPU、内存、磁盘/文件系统、Redis 二进制校验值和提交号；
+复现实验时仍必须补齐这些环境元数据。v0.6.2 的发布决定是在保留这一可复现性缺口
+和上述性能债务说明的前提下作出。
+
 `--targets skiplist,rbtree` 可用于不启动 Redis 的本项目 smoke；Hash 仍只运行一次，
 ZSet 分别运行两个后端。正式三方对照保持默认
 `--targets skiplist,rbtree,redis`，并必须提供 `--redis-server`。
@@ -441,6 +554,9 @@ v0.4 的阶段性能基线及解释记录在发布说明中；以上 v0.5.1 数�
 
 ## 当前限制
 
+- v0.6.2 在明确接受严格门禁 `passed: false` 的前提下发布：Hash P16 的三个 Redis
+  对照单元 QPS 未达标，且 String/Hash 的部分 everysec QPS 损失与 ZSet P16
+  everysec P99 增幅超过原门槛；详见上文验收表和原始结果文件。
 - AOF rewrite、MySQL Cache-Aside、配置文件、集群和复制尚未实现；RDB 不是 Redis
   RDB 格式，检查点前 AOF 历史不会清理。
 - `SAVE` 按 Redis 语义同步阻塞 Reactor，只用于人工维护、诊断和确定性测试，不进入

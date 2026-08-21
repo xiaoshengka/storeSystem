@@ -142,6 +142,31 @@ int main(void)
     fd = open(path, O_WRONLY | O_TRUNC);
     assert(fd >= 0);
     assert(close(fd) == 0);
+    assert(aof_open(&aof, path, AOF_FSYNC_EVERYSEC) == 0);
+    {
+        struct timespec delay = {0, 1000000L};
+        aof_info_t info;
+        int attempts;
+
+        for (attempts = 0; attempts < 1200; ++attempts) {
+            uint64_t sequence = 0;
+
+            assert(aof_transaction_begin(aof) == 0);
+            assert(aof_append(aof, set_arguments, 3U) == 0);
+            assert(aof_transaction_commit(aof, &sequence) == 0);
+            assert(sequence > 0);
+            assert(aof_flush(aof) == 0);
+            assert(nanosleep(&delay, NULL) == 0);
+        }
+        aof_get_info(aof, &info);
+        assert(info.fsync_count >= 1U);
+        assert(info.synced_sequence > 0U);
+    }
+    assert(aof_close(aof) == 0);
+
+    fd = open(path, O_WRONLY | O_TRUNC);
+    assert(fd >= 0);
+    assert(close(fd) == 0);
     assert(aof_open(&aof, path, AOF_FSYNC_NO) == 0);
     {
         uint64_t sequence = 0;

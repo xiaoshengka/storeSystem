@@ -49,6 +49,9 @@ struct cache {
     size_t zset_keys;
     size_t hash_fields;
     size_t zset_members;
+    cache_entry_t *hash_hot_entry;
+    const void *hash_hot_key;
+    size_t hash_hot_key_length;
     int lru_enabled;
 };
 
@@ -298,6 +301,11 @@ static void entry_remove(cache_t *cache,
                          cache_entry_t *entry,
                          enum removal_reason reason)
 {
+    if (cache->hash_hot_entry == entry) {
+        cache->hash_hot_entry = NULL;
+        cache->hash_hot_key = NULL;
+        cache->hash_hot_key_length = 0;
+    }
     if (reason == REMOVE_EVICTED && cache->on_evict != NULL) {
         cache->on_evict(kv_hash_node_key(entry->index_node),
                         kv_hash_node_key_length(entry->index_node),
@@ -919,4 +927,49 @@ int cache_visit(cache_t *cache, cache_visit_fn callback, void *context)
                      context) != 0) return -1;
     }
     return 0;
+}
+
+static cache_entry_t *find_live_hash(cache_t *cache,
+                                     const void *key,
+                                     size_t key_length)
+{
+    cache_entry_t *entry = cache->hash_hot_entry;
+
+    if (entry != NULL && cache->hash_hot_key_length == key_length &&
+        (key_length == 0 ||
+         memcmp(cache->hash_hot_key, key, key_length) == 0)) {
+        if (entry->expire_at_ms == 0) return entry;
+        if (cache_now(cache) < entry->expire_at_ms) return entry;
+        entry_remove(cache, entry, REMOVE_EXPIRED);
+        return NULL;
+    }
+    entry = find_live(cache, key, key_length, UINT64_MAX);
+    cache->hash_hot_entry = entry;
+    cache->hash_hot_key = entry == NULL
+                              ? NULL
+                              : kv_hash_node_key(entry->index_node);
+    cache->hash_hot_key_length = entry == NULL ? 0 : key_length;
+    return entry;
+}
+
+kv_object_t *cache_get_hash_object_ref(
+    cache_t *cache,
+    const void *key,
+    size_t key_length,
+    int record_hit_or_miss,
+    cache_entry_ref_t **entry_ref)
+{
+    cache_entry_t *entry;
+
+    if (entry_ref != NULL) *entry_ref = NULL;
+    if (cache == NULL || !valid_bytes(key, key_length)) return NULL;
+    entry = find_live_hash(cache, key, key_length);
+    if (entry == NULL) {
+        if (record_hit_or_miss) cache->misses++;
+        return NULL;
+    }
+    if (record_hit_or_miss) cache->hits++;
+    lru_touch(cache, entry);
+    if (entry_ref != NULL) *entry_ref = entry;
+    return entry->object;
 }

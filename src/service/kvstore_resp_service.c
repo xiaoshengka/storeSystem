@@ -252,6 +252,49 @@ static size_t bulk_encoded_size(size_t length)
     return length + decimal_digits(length) + 5U;
 }
 
+static int format_score(unsigned char *output, size_t capacity, double score)
+{
+    double scaled;
+
+    if (output == NULL || capacity == 0) return -1;
+    scaled = score * 10.0;
+    if (isfinite(score) && !(score == 0.0 && signbit(score)) &&
+        scaled >= (double)INT64_MIN && scaled <= (double)INT64_MAX) {
+        int64_t tenths = (int64_t)scaled;
+
+        if (scaled == (double)tenths && (double)tenths / 10.0 == score) {
+            unsigned char reverse[32];
+            uint64_t magnitude = tenths < 0
+                                     ? (uint64_t)(-(tenths + 1)) + 1U
+                                     : (uint64_t)tenths;
+            unsigned int fraction = (unsigned int)(magnitude % 10U);
+            uint64_t whole = magnitude / 10U;
+            size_t digits = 0;
+            size_t position = 0;
+            size_t index;
+            size_t needed;
+
+            do {
+                reverse[digits++] = (unsigned char)('0' + whole % 10U);
+                whole /= 10U;
+            } while (whole != 0);
+            needed = digits + (tenths < 0 ? 1U : 0U) +
+                     (fraction != 0 ? 2U : 0U);
+            if (needed > capacity) return -1;
+            if (tenths < 0) output[position++] = '-';
+            for (index = 0; index < digits; ++index) {
+                output[position++] = reverse[digits - index - 1U];
+            }
+            if (fraction != 0) {
+                output[position++] = '.';
+                output[position++] = (unsigned char)('0' + fraction);
+            }
+            return (int)position;
+        }
+    }
+    return snprintf((char *)output, capacity, "%.17g", score);
+}
+
 static int parse_double_argument(const kvstore_argument_t *argument,
                                  double *result)
 {
@@ -718,11 +761,8 @@ static int execute_hset(kvstore_service_t *service,
 {
     size_t pair_count = (argument_count - 2U) / 2U;
     cache_entry_ref_t *entry_ref = NULL;
-    kv_object_t *original = cache_get_object_ref(service->cache,
-                                                 arguments[1].data,
-                                                 arguments[1].length,
-                                                 0,
-                                                 &entry_ref);
+    kv_object_t *original = cache_get_hash_object_ref(
+        service->cache, arguments[1].data, arguments[1].length, 0, &entry_ref);
     kv_object_t *working = original;
     size_t index;
     int added_total = 0;
@@ -803,11 +843,8 @@ static int execute_hdel(kvstore_service_t *service,
                         kvstore_reply_t *reply)
 {
     cache_entry_ref_t *entry_ref = NULL;
-    kv_object_t *object = cache_get_object_ref(service->cache,
-                                               arguments[1].data,
-                                               arguments[1].length,
-                                               0,
-                                               &entry_ref);
+    kv_object_t *object = cache_get_hash_object_ref(
+        service->cache, arguments[1].data, arguments[1].length, 0, &entry_ref);
     size_t index;
     int removed = 0;
 
@@ -888,10 +925,8 @@ static int execute_hgetall(kvstore_service_t *service,
                            const kvstore_argument_t *arguments,
                            kvstore_reply_t *reply)
 {
-    kv_object_t *object = cache_get_object(service->cache,
-                                           arguments[1].data,
-                                           arguments[1].length,
-                                           1);
+    kv_object_t *object = cache_get_hash_object_ref(
+        service->cache, arguments[1].data, arguments[1].length, 1, NULL);
     hash_array_context_t context;
     size_t fields;
     int reserve_result;
@@ -1139,7 +1174,7 @@ static int collect_zset_member(const void *member,
     if (collection->with_scores) {
         unsigned char *destination = collection->service->reply_score_buffer +
                                      collection->score_index * 32U;
-        int written = snprintf((char *)destination, 32U, "%.17g", score);
+        int written = format_score(destination, 32U, score);
         size_t score_size;
 
         if (written < 0 || written >= 32) return -1;
@@ -1528,10 +1563,8 @@ static int execute_command(kvstore_service_t *service,
         return execute_hset(service, arguments, argument_count, reply);
     case SERVICE_COMMAND_HGET:
         {
-            kv_object_t *object = cache_get_object(service->cache,
-                                                   arguments[1].data,
-                                                   arguments[1].length,
-                                                   1);
+            kv_object_t *object = cache_get_hash_object_ref(
+                service->cache, arguments[1].data, arguments[1].length, 1, NULL);
 
             if (object == NULL) {
                 reply->type = KVSTORE_REPLY_NULL_BULK;
@@ -1551,10 +1584,8 @@ static int execute_command(kvstore_service_t *service,
         return execute_hdel(service, arguments, argument_count, reply);
     case SERVICE_COMMAND_HLEN:
         {
-            kv_object_t *object = cache_get_object(service->cache,
-                                                   arguments[1].data,
-                                                   arguments[1].length,
-                                                   1);
+            kv_object_t *object = cache_get_hash_object_ref(
+                service->cache, arguments[1].data, arguments[1].length, 1, NULL);
 
             if (object == NULL) set_integer(reply, 0);
             else if (kv_object_type(object) != KV_OBJECT_HASH) set_wrongtype(reply);
@@ -1599,10 +1630,9 @@ static int execute_command(kvstore_service_t *service,
                     set_error(reply, error_internal, sizeof(error_internal) - 1U);
                     return 0;
                 }
-                written = snprintf((char *)service->reply_score_buffer,
-                                   32U,
-                                   "%.17g",
-                                   score);
+                written = format_score(service->reply_score_buffer,
+                                       32U,
+                                       score);
                 if (written < 0 || written >= 32) {
                     set_error(reply, error_internal, sizeof(error_internal) - 1U);
                 } else {

@@ -203,7 +203,8 @@ valgrind-run: test_buffer test_kvstore test_resp test_hash test_object test_cach
 
 helgrind:
 	$(MAKE) ALLOCATOR=libc clean
-	$(MAKE) ALLOCATOR=libc test_aof kvstore
+	$(MAKE) ALLOCATOR=libc CPPFLAGS="$(CPPFLAGS) -DKVSTORE_HELGRIND" \
+		test_aof kvstore
 	valgrind --tool=helgrind --error-exitcode=1 ./test_aof
 	KVSTORE_AOF_SERVER_PREFIX="valgrind --tool=helgrind --error-exitcode=1" \
 		python3 tests/aof_integration.py
