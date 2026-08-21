@@ -49,6 +49,7 @@ struct cache {
     size_t zset_keys;
     size_t hash_fields;
     size_t zset_members;
+    int lru_enabled;
 };
 
 static int valid_bytes(const void *data, size_t length)
@@ -255,6 +256,7 @@ static void heap_expiration_changed(cache_t *cache, cache_entry_t *entry)
 
 static void lru_unlink(cache_t *cache, cache_entry_t *entry)
 {
+    if (!cache->lru_enabled) return;
     if (entry->lru_previous != NULL) {
         entry->lru_previous->lru_next = entry->lru_next;
     } else {
@@ -271,6 +273,7 @@ static void lru_unlink(cache_t *cache, cache_entry_t *entry)
 
 static void lru_link_head(cache_t *cache, cache_entry_t *entry)
 {
+    if (!cache->lru_enabled) return;
     entry->lru_previous = NULL;
     entry->lru_next = cache->lru_head;
     if (cache->lru_head != NULL) {
@@ -283,6 +286,7 @@ static void lru_link_head(cache_t *cache, cache_entry_t *entry)
 
 static void lru_touch(cache_t *cache, cache_entry_t *entry)
 {
+    if (!cache->lru_enabled) return;
     if (cache->lru_head == entry) {
         return;
     }
@@ -329,6 +333,9 @@ static cache_entry_t *find_live(cache_t *cache,
         return NULL;
     }
     entry = kv_hash_node_payload(node);
+    if (entry->expire_at_ms != 0) {
+        if (now == UINT64_MAX) now = cache_now(cache);
+    }
     if (entry->expire_at_ms != 0 && now >= entry->expire_at_ms) {
         entry_remove(cache, entry, REMOVE_EXPIRED);
         return NULL;
@@ -372,6 +379,8 @@ int cache_create(cache_t **out_cache, const cache_config_t *config)
     if (config != NULL) {
         cache->config = *config;
     }
+    cache->lru_enabled = cache->config.max_keys != 0 ||
+                         cache->config.max_memory != 0;
     if (cache->config.now_ms == NULL) {
         cache->config.now_ms = system_now_ms;
         cache->config.clock_context = NULL;
@@ -389,10 +398,24 @@ void cache_destroy(cache_t *cache)
     if (cache == NULL) {
         return;
     }
-    while (cache->lru_tail != NULL) {
-        entry_remove(cache, cache->lru_tail, REMOVE_NORMAL);
+    if (cache->lru_enabled) {
+        while (cache->lru_tail != NULL) {
+            entry_remove(cache, cache->lru_tail, REMOVE_NORMAL);
+        }
+        kv_hash_release(cache->index, NULL);
+    } else {
+        kv_hash_iterator_t iterator;
+        kv_hash_node_t *node;
+
+        kv_hash_iterator_begin(cache->index, &iterator);
+        while ((node = kv_hash_iterator_next(&iterator)) != NULL) {
+            cache_entry_t *entry = kv_hash_node_payload(node);
+
+            kv_object_destroy(entry->object);
+            free(entry);
+        }
+        kv_hash_release(cache->index, NULL);
     }
-    kv_hash_release(cache->index, NULL);
     free(cache->expire_heap);
     free(cache);
 }
@@ -423,7 +446,7 @@ int cache_store_object(cache_t *cache,
     if (cache == NULL || !valid_bytes(key, key_length) || object == NULL) {
         return CACHE_SET_ERROR;
     }
-    now = cache_now(cache);
+    now = expire_at != 0 ? cache_now(cache) : UINT64_MAX;
     new_charge = entry_memory_charge(key_length, object);
     new_items = object_item_count(object);
     if (new_charge == SIZE_MAX ||
@@ -473,15 +496,16 @@ int cache_store_object(cache_t *cache,
                                kv_hash_count(cache->index),
                                projected_memory)) {
             cache_entry_t *candidate = eviction_candidate(cache, entry);
+            int expired;
 
             if (candidate == NULL) return CACHE_SET_CAPACITY;
+            if (candidate->expire_at_ms != 0 && now == UINT64_MAX)
+                now = cache_now(cache);
+            expired = candidate->expire_at_ms != 0 &&
+                      now >= candidate->expire_at_ms;
             projected_memory -= candidate->memory_charge;
-            entry_remove(cache,
-                         candidate,
-                         candidate->expire_at_ms != 0 &&
-                                 now >= candidate->expire_at_ms
-                             ? REMOVE_EXPIRED
-                             : REMOVE_EVICTED);
+            entry_remove(cache, candidate,
+                         expired ? REMOVE_EXPIRED : REMOVE_EVICTED);
         }
 
         cache->used_memory = cache->used_memory - entry->memory_charge +
@@ -533,6 +557,7 @@ int cache_store_object(cache_t *cache,
                            kv_hash_count(cache->index),
                            cache->used_memory)) {
         cache_entry_t *candidate = eviction_candidate(cache, entry);
+        int expired;
 
         if (candidate == NULL) {
             entry->object = NULL;
@@ -546,11 +571,11 @@ int cache_store_object(cache_t *cache,
             free(entry);
             return CACHE_SET_CAPACITY;
         }
-        entry_remove(cache,
-                     candidate,
-                     candidate->expire_at_ms != 0 && now >= candidate->expire_at_ms
-                         ? REMOVE_EXPIRED
-                         : REMOVE_EVICTED);
+        if (candidate->expire_at_ms != 0 && now == UINT64_MAX)
+            now = cache_now(cache);
+        expired = candidate->expire_at_ms != 0 && now >= candidate->expire_at_ms;
+        entry_remove(cache, candidate,
+                     expired ? REMOVE_EXPIRED : REMOVE_EVICTED);
     }
     return CACHE_SET_OK;
 }
@@ -591,7 +616,7 @@ int cache_set(cache_t *cache,
     if (cache == NULL) {
         return CACHE_SET_ERROR;
     }
-    now = cache_now(cache);
+    now = ttl_ms == 0 ? 0 : cache_now(cache);
     if (ttl_ms != 0 && ttl_ms > UINT64_MAX - now) {
         return CACHE_SET_RANGE;
     }
@@ -608,16 +633,31 @@ kv_object_t *cache_get_object(cache_t *cache,
                               size_t key_length,
                               int record_hit_or_miss)
 {
+    return cache_get_object_ref(cache,
+                                key,
+                                key_length,
+                                record_hit_or_miss,
+                                NULL);
+}
+
+kv_object_t *cache_get_object_ref(cache_t *cache,
+                                  const void *key,
+                                  size_t key_length,
+                                  int record_hit_or_miss,
+                                  cache_entry_ref_t **entry_ref)
+{
     cache_entry_t *entry;
 
+    if (entry_ref != NULL) *entry_ref = NULL;
     if (cache == NULL || !valid_bytes(key, key_length)) return NULL;
-    entry = find_live(cache, key, key_length, cache_now(cache));
+    entry = find_live(cache, key, key_length, UINT64_MAX);
     if (entry == NULL) {
         if (record_hit_or_miss) cache->misses++;
         return NULL;
     }
     if (record_hit_or_miss) cache->hits++;
     lru_touch(cache, entry);
+    if (entry_ref != NULL) *entry_ref = entry;
     return entry->object;
 }
 
@@ -639,15 +679,27 @@ int cache_recharge_object(cache_t *cache,
                           size_t key_length)
 {
     cache_entry_t *entry;
+
+    if (cache == NULL || !valid_bytes(key, key_length)) return CACHE_SET_ERROR;
+    entry = find_live(cache, key, key_length, UINT64_MAX);
+    return cache_recharge_ref(cache, entry);
+}
+
+int cache_recharge_ref(cache_t *cache, cache_entry_ref_t *entry_ref)
+{
+    cache_entry_t *entry = entry_ref;
     size_t new_charge;
     size_t new_items;
     size_t projected;
     uint64_t now;
+    size_t key_length;
 
-    if (cache == NULL || !valid_bytes(key, key_length)) return CACHE_SET_ERROR;
-    now = cache_now(cache);
-    entry = find_live(cache, key, key_length, now);
-    if (entry == NULL) return CACHE_SET_ERROR;
+    if (cache == NULL || entry == NULL || entry->index_node == NULL)
+        return CACHE_SET_ERROR;
+    now = entry->expire_at_ms != 0 ? cache_now(cache) : 0;
+    if (entry->expire_at_ms != 0 && now >= entry->expire_at_ms)
+        return CACHE_SET_ERROR;
+    key_length = kv_hash_node_key_length(entry->index_node);
     new_charge = entry_memory_charge(key_length, entry->object);
     if (new_charge == SIZE_MAX ||
         (cache->config.max_memory != 0 &&
@@ -689,7 +741,7 @@ int cache_delete(cache_t *cache, const void *key, size_t key_length)
     if (cache == NULL || !valid_bytes(key, key_length)) {
         return -1;
     }
-    entry = find_live(cache, key, key_length, cache_now(cache));
+    entry = find_live(cache, key, key_length, UINT64_MAX);
     if (entry == NULL) {
         return 0;
     }
@@ -756,7 +808,7 @@ int cache_persist(cache_t *cache, const void *key, size_t key_length)
     if (cache == NULL || !valid_bytes(key, key_length)) {
         return -1;
     }
-    entry = find_live(cache, key, key_length, cache_now(cache));
+    entry = find_live(cache, key, key_length, UINT64_MAX);
     if (entry == NULL || entry->expire_at_ms == 0) {
         return 0;
     }
@@ -848,4 +900,23 @@ void cache_get_stats(const cache_t *cache, cache_stats_t *stats)
 uint64_t cache_current_time_ms(const cache_t *cache)
 {
     return cache == NULL ? 0 : cache_now(cache);
+}
+
+int cache_visit(cache_t *cache, cache_visit_fn callback, void *context)
+{
+    kv_hash_iterator_t iterator;
+    kv_hash_node_t *node;
+
+    if (cache == NULL || callback == NULL) return -1;
+    kv_hash_iterator_begin(cache->index, &iterator);
+    while ((node = kv_hash_iterator_next(&iterator)) != NULL) {
+        cache_entry_t *entry = kv_hash_node_payload(node);
+
+        if (callback(kv_hash_node_key(node),
+                     kv_hash_node_key_length(node),
+                     entry->object,
+                     entry->expire_at_ms,
+                     context) != 0) return -1;
+    }
+    return 0;
 }

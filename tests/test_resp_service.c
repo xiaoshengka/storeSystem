@@ -8,6 +8,37 @@ typedef struct fake_clock {
     uint64_t now_ms;
 } fake_clock_t;
 
+typedef struct fake_persistence {
+    int foreground_saves;
+    int background_saves;
+    uint64_t lastsave;
+} fake_persistence_t;
+
+static int fake_save(void *context, int background)
+{
+    fake_persistence_t *persistence = context;
+
+    if (background) persistence->background_saves++;
+    else persistence->foreground_saves++;
+    return 0;
+}
+
+static uint64_t fake_lastsave(void *context)
+{
+    return ((fake_persistence_t *)context)->lastsave;
+}
+
+static void fake_persistence_info(void *context,
+                                  kvstore_persistence_info_t *info)
+{
+    fake_persistence_t *persistence = context;
+
+    info->rdb_enabled = 1;
+    info->bgsave_in_progress = persistence->background_saves != 0;
+    info->last_save_time = persistence->lastsave;
+    info->checkpoint_offset = 321U;
+}
+
 static uint64_t fake_now(void *context)
 {
     return ((fake_clock_t *)context)->now_ms;
@@ -42,6 +73,10 @@ int main(void)
     kvstore_argument_t arguments[8];
     kvstore_service_t service;
     kvstore_reply_t reply;
+    fake_persistence_t persistence = {0, 0, 123U};
+    kvstore_persistence_admin_t admin = {
+        fake_save, fake_lastsave, fake_persistence_info
+    };
 
     config.max_keys = 32U;
     config.now_ms = fake_now;
@@ -117,6 +152,26 @@ int main(void)
     assert(strstr((const char *)reply.data, "keys:") != NULL);
     assert(strstr((const char *)reply.data, "hits:1\r\n") != NULL);
     assert(strstr((const char *)reply.data, "misses:1\r\n") != NULL);
+
+    kvstore_service_set_persistence_admin(&service, &admin, &persistence);
+    arguments[0] = argument("SAVE", 4);
+    reply = execute(&service, arguments, 1U);
+    assert(reply.type == KVSTORE_REPLY_SIMPLE &&
+           persistence.foreground_saves == 1);
+    arguments[0] = argument("BGSAVE", 6);
+    reply = execute(&service, arguments, 1U);
+    assert(reply.type == KVSTORE_REPLY_SIMPLE &&
+           persistence.background_saves == 1);
+    arguments[0] = argument("LASTSAVE", 8);
+    reply = execute(&service, arguments, 1U);
+    assert(reply.type == KVSTORE_REPLY_INTEGER && reply.integer == 123);
+    arguments[0] = argument("INFO", 4);
+    arguments[1] = argument("PERSISTENCE", 11);
+    reply = execute(&service, arguments, 2U);
+    assert(reply.type == KVSTORE_REPLY_BULK);
+    assert(strstr((const char *)reply.data, "rdb_enabled:1\r\n") != NULL);
+    assert(strstr((const char *)reply.data,
+                  "rdb_checkpoint_offset:321\r\n") != NULL);
 
     arguments[0] = argument("PING", 4);
     reply = execute(&service, arguments, 1U);

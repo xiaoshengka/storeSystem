@@ -15,6 +15,10 @@ void net_buffer_destroy(net_buffer_t *buffer);
 void net_buffer_reset(net_buffer_t *buffer);
 size_t net_buffer_readable(const net_buffer_t *buffer);
 int net_buffer_reserve(net_buffer_t *buffer, size_t additional);
+void *net_buffer_write_pointer(net_buffer_t *buffer,
+                               size_t additional,
+                               size_t *capacity);
+int net_buffer_commit(net_buffer_t *buffer, size_t length);
 int net_buffer_append(net_buffer_t *buffer, const void *data, size_t length);
 void net_buffer_consume(net_buffer_t *buffer, size_t length);
 

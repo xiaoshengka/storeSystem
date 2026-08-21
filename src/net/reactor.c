@@ -65,7 +65,6 @@ struct reactor {
     reactor_barrier_ready_handler barrier_handler;
     void *barrier_context;
     reactor_connection_t *clients;
-    unsigned char *response_scratch;
 };
 
 static int set_nonblocking(int fd)
@@ -301,24 +300,20 @@ static int refresh_client_events(reactor_connection_t *connection)
 
 static int process_input(reactor_connection_t *connection)
 {
-    unsigned char *response = connection->owner->response_scratch;
-
     while (net_buffer_readable(&connection->input) > 0 &&
            net_buffer_readable(&connection->output) < REACTOR_OUTPUT_HIGH_WATER &&
            !connection->close_after_write) {
         size_t available = net_buffer_readable(&connection->input);
         size_t consumed = 0;
-        size_t response_length = 0;
+        size_t output_before = connection->output.write_pos;
         uint64_t response_barrier = 0;
         int close_after_response = 0;
         int result = connection->owner->handler(
             (const unsigned char *)connection->input.data + connection->input.read_pos,
             available,
             connection->peer_eof,
-            response,
-            REACTOR_MAX_RESPONSE,
+            &connection->output,
             &consumed,
-            &response_length,
             &close_after_response,
             &response_barrier,
             connection->owner->handler_context);
@@ -331,15 +326,13 @@ static int process_input(reactor_connection_t *connection)
             break;
         }
         if (result != REACTOR_HANDLER_COMPLETE || consumed == 0 ||
-            consumed > available || response_length > REACTOR_MAX_RESPONSE) {
+            consumed > available ||
+            connection->output.write_pos < output_before ||
+            connection->output.write_pos - output_before > REACTOR_MAX_RESPONSE) {
             errno = EPROTO;
             return -1;
         }
         net_buffer_consume(&connection->input, consumed);
-        if (response_length > 0 &&
-            net_buffer_append(&connection->output, response, response_length) != 0) {
-            return -1;
-        }
         if (response_barrier > connection->response_barrier) {
             connection->response_barrier = response_barrier;
         }
@@ -353,17 +346,23 @@ static int process_input(reactor_connection_t *connection)
 
 static int handle_read(reactor_connection_t *connection)
 {
-    char chunk[REACTOR_IO_CHUNK];
-
     for (;;) {
+        void *destination;
+        size_t capacity;
+
         if (connection->close_after_write ||
             net_buffer_readable(&connection->output) >= REACTOR_OUTPUT_HIGH_WATER) {
             break;
         }
-        ssize_t received = recv(connection->fd, chunk, sizeof(chunk), 0);
+        destination = net_buffer_write_pointer(&connection->input,
+                                               REACTOR_IO_CHUNK,
+                                               &capacity);
+        if (destination == NULL) return -1;
+        if (capacity > REACTOR_IO_CHUNK) capacity = REACTOR_IO_CHUNK;
+        ssize_t received = recv(connection->fd, destination, capacity, 0);
 
         if (received > 0) {
-            if (net_buffer_append(&connection->input, chunk, (size_t)received) != 0 ||
+            if (net_buffer_commit(&connection->input, (size_t)received) != 0 ||
                 process_input(connection) != 0) {
                 return -1;
             }
@@ -465,17 +464,11 @@ int reactor_init(reactor_t **out_reactor,
     if (reactor == NULL) {
         return -1;
     }
-    reactor->response_scratch = malloc(REACTOR_MAX_RESPONSE);
-    if (reactor->response_scratch == NULL) {
-        free(reactor);
-        return -1;
-    }
     reactor->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     reactor->port = port;
     reactor->handler = handler;
     reactor->handler_context = handler_context;
     if (reactor->epoll_fd < 0) {
-        free(reactor->response_scratch);
         free(reactor);
         return -1;
     }
@@ -677,6 +670,25 @@ int reactor_set_periodic(reactor_t *reactor,
     return 0;
 }
 
+void reactor_close_in_child(reactor_t *reactor)
+{
+    reactor_connection_t *connection;
+
+    if (reactor == NULL) return;
+    if (reactor->listener != NULL && reactor->listener->fd >= 0)
+        (void)close(reactor->listener->fd);
+    if (reactor->wake_source != NULL && reactor->wake_source->fd >= 0)
+        (void)close(reactor->wake_source->fd);
+    if (reactor->timer_source != NULL && reactor->timer_source->fd >= 0)
+        (void)close(reactor->timer_source->fd);
+    for (connection = reactor->clients;
+         connection != NULL;
+         connection = connection->next) {
+        if (connection->fd >= 0) (void)close(connection->fd);
+    }
+    if (reactor->epoll_fd >= 0) (void)close(reactor->epoll_fd);
+}
+
 void reactor_stop(reactor_t *reactor)
 {
     uint64_t value = 1;
@@ -709,6 +721,5 @@ void reactor_destroy(reactor_t *reactor)
         close(reactor->epoll_fd);
         reactor->epoll_fd = -1;
     }
-    free(reactor->response_scratch);
     free(reactor);
 }

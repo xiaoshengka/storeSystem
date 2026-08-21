@@ -2,9 +2,9 @@
 
 基于 Linux C、非阻塞 Socket 与单线程 epoll Reactor 的内存 KV 缓存服务。
 
-当前开发版本为 `v0.6.1`：在 v0.6.0 类型对象基础上优化连续内存布局，并把 AOF
-普通写入与同步统一移到单个 pthread writer。网络仍是单线程 epoll Reactor；不引入
-io_uring。RDB、BGSAVE、AOF rewrite 与混合加载留到 v0.6.2 或后续版本。
+当前开发版本为 `v0.6.2`：新增项目原生 RDB、同步 `SAVE`、fork 子进程异步
+`BGSAVE`、自动快照以及 RDB+AOF 检查点尾部恢复。网络仍是单线程 epoll Reactor；
+后台执行单元只有 AOF writer 和 BGSAVE 子进程，不引入 io_uring。
 
 ## 架构
 
@@ -16,11 +16,13 @@ Client
   -> Cache（顶层动态 Hash + TTL 最小堆 + LRU + 统计）
   -> 类型对象（Hash；成员 Hash + SkipList/RBTree ZSet）
   -> AOF（命令 transaction + chunk SPSC 队列 + writer writev/fdatasync + mmap 回放）
+  -> RDB（KVRDB001 + CRC64 + fork BGSAVE + 原子替换）
 ```
 
 Reactor 负责连接、非阻塞收发、Pipeline 背压、周期回调和资源回收；协议层只处理
 RESP 字节帧；服务层负责命令语义；Cache 不依赖网络或 RESP；Hash 只负责二进制
-key 的索引。v0.6.1 设计见
+key 的索引。v0.6.2 设计与验收口径见
+[`docs/v0.6.2-rdb-performance.md`](docs/v0.6.2-rdb-performance.md)；v0.6.1 设计见
 [`docs/v0.6.1-memory-aof.md`](docs/v0.6.1-memory-aof.md)；v0.6 集合设计见
 [`docs/typed-collections-v0.6.md`](docs/typed-collections-v0.6.md)；v0.5.1 AOF 设计见
 [`docs/aof-v0.5.1.md`](docs/aof-v0.5.1.md)；v0.4 Cache 设计见
@@ -54,7 +56,7 @@ make
   90% 读/10% 写和固定宽度 ZRANGE，可同时驱动本项目与 Redis。
 - `legacy_client`：旧文本协议历史客户端，不用于 epoll 主服务。
 
-## 启动、容量与 AOF
+## 启动、容量与持久化
 
 ```bash
 ./kvstore
@@ -63,6 +65,9 @@ make
 ./kvstore --zset-engine rbtree
 ./kvstore --appendonly yes --appendfilename appendonly.aof \
   --appendfsync everysec
+./kvstore --rdb yes --dbfilename dump.kvrdb
+./kvstore --rdb yes --dbfilename dump.kvrdb \
+  --save-seconds 60 --save-changes 10000
 ```
 
 - `--maxmemory`：缓存条目的逻辑字节上限，接受字节数或大小写不敏感的
@@ -76,6 +81,10 @@ make
 - `--appendfilename`：AOF 路径，默认 `appendonly.aof`。
 - `--appendfsync always|everysec|no`：每条写命令同步、约每秒同步或交给操作系统，
   默认 `everysec`。该选项只在 AOF 开启时生效。
+- `--rdb yes|no`：启用 RDB 保存/加载，默认 `no`。
+- `--dbfilename`：RDB 路径，默认 `dump.kvrdb`。
+- `--save-seconds N --save-changes M`：两个值必须同时为非零；经过至少 N 秒且累计
+  至少 M 次成功写后自动触发一次 `BGSAVE`。自动保存不会调用阻塞式 `SAVE`。
 
 `maxmemory` 统计 key/value 分配及缓存条目和 Hash 节点的固定元数据，不等同于
 进程 RSS。Hash 桶数组和 TTL 堆的预留空间通过 `index_memory` 单独报告。
@@ -87,6 +96,11 @@ make
 `ERR AOF persistence unavailable`。若批次末尾的合并 write 失败，服务会关闭当时
 已有的客户端连接，避免发送尚未成功追加 AOF 的 `OK`；之后新连接仍可读取，写入
 会返回上述错误。
+
+同时启用 RDB 和 AOF 时，RDB 必须包含与当前 AOF 匹配的随机 `PING` 检查点及字节
+偏移；启动先加载 RDB，再从该偏移回放 AOF 尾部。令牌、偏移、CRC 或格式不匹配会
+严格拒绝启动，不会退化为全量 AOF 回放。只启用 RDB 时不要求 AOF 文件；只存在 AOF
+而没有 RDB 时仍执行完整回放。本版本不做 AOF rewrite，因此检查点之前的历史仍保留。
 
 ### AOF 记录范围与缓冲
 
@@ -126,7 +140,7 @@ AOF 只记录实际改变 Cache 的写操作：
 | `TTL key` / `PTTL key` | 查询剩余 TTL | Integer |
 | `PERSIST key` | 清除 TTL | Integer `1` 或 `0` |
 | `INFO CACHE` | 查询缓存统计 | Bulk String |
-| `INFO PERSISTENCE` | 查询 AOF 队列、序号、字节、背压与错误状态 | Bulk String |
+| `INFO PERSISTENCE` | 查询 AOF、RDB、BGSAVE、fork 与刷盘统计 | Bulk String |
 | `DBSIZE` | 查询顶层 key 数，供恢复校验使用 | Integer |
 | `PING [message]` | 探活或回显 | Simple/Bulk String |
 | `HSET key field value [field value ...]` | 新增或更新 field | 新增 field 数 |
@@ -139,6 +153,9 @@ AOF 只记录实际改变 Cache 的写操作：
 | `ZSCORE key member` | 查询 score | Bulk String 或 Null Bulk |
 | `ZCARD key` | member 数 | Integer |
 | `ZRANGE key start stop [WITHSCORES]` | 按闭区间 rank 查询，支持负数 | Array of Bulk Strings |
+| `SAVE` | 在 Reactor 中同步写快照；完成前阻塞服务 | `+OK` 或 Error |
+| `BGSAVE` | 一致性屏障后 fork 子进程写快照 | Simple String 或 Error |
+| `LASTSAVE` | 最近一次成功快照的 Unix 秒，无则为 0 | Integer |
 
 `TTL/PTTL` 对缺失或已过期 key 返回 `-2`，对永久 key 返回 `-1`。非正数
 `EXPIRE/PEXPIRE` 会立即删除现有 key；`SET EX/PX` 要求严格正整数。
@@ -161,8 +178,8 @@ hash_fields zset_members zset_engine
 
 - Hash 从 16 桶开始，在负载因子达到 0.75 时扩容为两倍；请求操作和周期维护分批
   搬迁旧桶，避免一次性 O(N) rehash 阻塞 Reactor。
-- 每个缓存条目位于精确 LRU 双向链表中，成功 `GET/SET` 移到头部，淘汰从尾部
-  开始。
+- 启用 `maxmemory` 或 `maxkeys` 后，每个缓存条目位于精确 LRU 双向链表中，成功
+  `GET/SET` 移到头部，淘汰从尾部开始；两个限制均为 0 时不维护 LRU 链表。
 - TTL 使用绝对 Unix 毫秒截止时间和最小堆；访问时惰性过期，timerfd 每 100 ms
   触发一次主动过期，每次最多删除 64 个 key。
 - 单个条目超过 `maxmemory` 时，`SET` 返回 `ERR cache capacity exceeded`，已有值
@@ -182,11 +199,13 @@ make helgrind
 ```
 
 - 单元测试覆盖缓冲区、RESP、旧引擎接口、动态 Hash、渐进 rehash、TTL 最小堆、
-  精确 LRU、双容量限制、统计、服务命令、AOF 缓冲/编解码、后台同步和尾部修复。
+  精确 LRU、双容量限制、统计、服务命令、AOF 缓冲/编解码、后台同步和尾部修复，
+  以及 RDB 三种对象、二进制数据、无穷 score、CRC、版本、截断和长度溢出。
 - 集成测试覆盖半包/粘包、Pipeline、背压、并发连接、二进制数据、half-close、
   协议错误、真实定时过期、小容量 LRU，以及 AOF 重启恢复、二进制 key/value 和
   绝对 TTL、Pipeline 批量 write、集合命令、两种 ZSet 后端交叉恢复，以及成功响应
-  后 SIGKILL 的启动恢复。
+  后 SIGKILL 的启动恢复；RDB 集成测试覆盖 SAVE/BGSAVE/LASTSAVE、自动触发、重复
+  BGSAVE、子进程失败、Pipeline 持续读写、混合尾部恢复和 ZSet 交叉恢复。
 - `make asan` 使用 ASan/UBSan；`make valgrind` 检查单元与集成主路径；
   `make helgrind` 专门覆盖 AOF writer 与 Reactor eventfd 协作。
 - `make benchmark-test` 对 AOF 重放脚本和可选延迟采样做小规模 smoke test，不是
@@ -285,25 +304,38 @@ python3 bench/redis_collection_compare.py \
   --csv bench/results/redis-6.2.23-smoke.csv
 ```
 
-确认本项目 Hash、两种 ZSet 后端和 Redis 的全部 workload 无错误后，再运行正式对照：
+确认本项目 Hash、两种 ZSet 后端和 Redis 的全部 workload 无错误后，再运行 v0.6.2
+正式对照。每个单元固定 5 轮；P16/P64、100,000 keyspace、64B payload、
+10,000,000 请求：
 
 ```bash
 make kvstore collection_bench_client
 python3 bench/redis_collection_compare.py \
   --redis-server /usr/local/bin/redis-server \
-  --repeats 5 --connections 32 --pipelines 16 \
-  --requests 1000000 --keyspace 100000 \
-  --csv bench/results/redis-6.2.23-collections.csv
+  --targets skiplist,rbtree,redis \
+  --workloads string-mixed,hash-mixed,zset-mixed \
+  --aof-policies off,everysec --scenarios normal,bgsave \
+  --repeats 5 --connections 32 --pipelines 16,64 \
+  --requests 10000000 --keyspace 100000 \
+  --csv bench/results/v0.6.2-redis-6.2.23.csv
+
+python3 bench/v062_release_gate.py \
+  --summary-csv bench/results/v0.6.2-redis-6.2.23.csv.summary.csv \
+  --json bench/results/v0.6.2-gate.json
 ```
 
-`--pipelines` 接受单值或逗号列表，例如 `1,4,8,16,32,64,128`；省略时只运行
-Pipeline 16，正式门槛也以 Pipeline 16 为准，各深度独立汇总而不混算中位数。
+`--pipelines` 接受单值或逗号列表，例如 `1,4,16,64`；P16/P64 是 v0.6.2 发布门槛，
+P1/P4 只作诊断，各深度独立汇总而不混算中位数。
 默认对 AOF off 运行全部 workload，并对含写 workload 额外运行 `appendfsync no` 和
 `everysec`。CSV 包含 QPS、Mean/P50/P95/P99/P99.9/max、错误数、VmHWM、逻辑
 内存、AOF 大小、共享数据 key、初始/预期/实际 cardinality 和 keyspace 范围；每轮
 结束前会用 `HLEN/ZCARD` 校验实际 cardinality，不一致立即失败。脚本启动时校验 Redis 必须是
 6.2.23，每轮打印 START/DONE、QPS、错误数和耗时，并在每轮结束后立即 flush CSV，
-中断时已完成结果不会丢失。客户端使用确定性 seed；正式报告还必须记录 OS、CPU、
+中断时已完成结果不会丢失。摘要计算 QPS 变异系数，超过 5% 的整组标记无效并以退出
+码 2 要求重跑。BGSAVE 单元在共享数据预加载后、客户端仍运行时触发一次后台快照，
+并记录快照持续时间、fork 暂停、父进程 VmHWM、子进程峰值 RSS/page faults 和 Redis
+COW 字节。门禁脚本按四组 ZSet mixed 的几何平均选择后端；差异不超过 1% 时保留
+SkipList，然后严格检查项目 QPS/P99 与 everysec 相对损失。客户端使用确定性 seed；正式报告还必须记录 OS、CPU、
 内存、磁盘、编译选项、客户端/服务端位置和持续时间。本仓库不写入未经目标 Ubuntu
 环境实测的集合性能数字。
 
@@ -409,9 +441,10 @@ v0.4 的阶段性能基线及解释记录在发布说明中；以上 v0.5.1 数�
 
 ## 当前限制
 
-- AOF rewrite、MySQL Cache-Aside、配置文件、集群和复制尚未实现。
-- AOF 普通文件 write 仍由 Reactor 执行；脏页限流或文件系统异常仍可能影响尾
-  延迟。`always` 按定义逐条等待 fdatasync，吞吐显著低于另外两种策略。
+- AOF rewrite、MySQL Cache-Aside、配置文件、集群和复制尚未实现；RDB 不是 Redis
+  RDB 格式，检查点前 AOF 历史不会清理。
+- `SAVE` 按 Redis 语义同步阻塞 Reactor，只用于人工维护、诊断和确定性测试，不进入
+  QPS 发布结果；生产快照使用 `BGSAVE`。`always` 按定义逐条等待 fdatasync。
 - Hash 只扩容、不缩容；当前仍使用已有的非加盐字节哈希函数。
 - LRU 是精确实现，不是 Redis 的抽样近似算法；TTL 不支持成员级过期。
-- RBTree 不再是 epoll 服务后端，计划在 v0.7 与 Skip List 一起用于有序集合模块。
+- io_uring、高维向量检索、负载均衡、分片、复制和集群不属于 v0.6.2。

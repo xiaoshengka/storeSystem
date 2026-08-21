@@ -123,6 +123,25 @@ int net_buffer_append(net_buffer_t *buffer, const void *data, size_t length)
     return 0;
 }
 
+void *net_buffer_write_pointer(net_buffer_t *buffer,
+                               size_t additional,
+                               size_t *capacity)
+{
+    if (capacity != NULL) *capacity = 0;
+    if (buffer == NULL || capacity == NULL ||
+        net_buffer_reserve(buffer, additional) != 0) return NULL;
+    *capacity = buffer->capacity - buffer->write_pos;
+    return buffer->data + buffer->write_pos;
+}
+
+int net_buffer_commit(net_buffer_t *buffer, size_t length)
+{
+    if (buffer == NULL || length > buffer->capacity - buffer->write_pos)
+        return -1;
+    buffer->write_pos += length;
+    return 0;
+}
+
 void net_buffer_consume(net_buffer_t *buffer, size_t length)
 {
     size_t readable;

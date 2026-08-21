@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -37,6 +38,7 @@ struct aof {
     aof_fsync_policy_t fsync_policy;
     pthread_t writer_thread;
     pthread_mutex_t mutex;
+    pthread_mutex_t sync_mutex;
     pthread_cond_t condition;
     int writer_started;
     int stopping;
@@ -59,6 +61,11 @@ struct aof {
     size_t transaction_used;
     size_t transaction_capacity;
     int transaction_active;
+    int pause_requested;
+    int paused;
+    uint64_t fsync_count;
+    uint64_t fsync_total_us;
+    uint64_t fsync_max_us;
 };
 
 static size_t decimal_length(size_t value)
@@ -252,15 +259,52 @@ static int enqueue_bytes(aof_t *aof, const unsigned char *data, size_t length,
 
 static int sync_written(aof_t *aof, uint64_t target)
 {
-    if (target <= aof->synced_sequence) return 0;
-    if (fdatasync(aof->fd) != 0) return -1;
-    aof->synced_sequence = target;
+    struct timespec start;
+    struct timespec end;
+    uint64_t elapsed_us = 0;
+
+    pthread_mutex_lock(&aof->sync_mutex);
+    pthread_mutex_lock(&aof->mutex);
+    if (target <= aof->synced_sequence) {
+        pthread_mutex_unlock(&aof->mutex);
+        pthread_mutex_unlock(&aof->sync_mutex);
+        return 0;
+    }
+    pthread_mutex_unlock(&aof->mutex);
+    (void)clock_gettime(CLOCK_MONOTONIC, &start);
+    if (fdatasync(aof->fd) != 0) {
+        pthread_mutex_unlock(&aof->sync_mutex);
+        return -1;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &end) == 0) {
+        time_t seconds = end.tv_sec - start.tv_sec;
+        long nanoseconds = end.tv_nsec - start.tv_nsec;
+
+        if (nanoseconds < 0) {
+            seconds--;
+            nanoseconds += 1000000000L;
+        }
+        if (seconds >= 0) {
+            elapsed_us = (uint64_t)seconds * UINT64_C(1000000) +
+                         (uint64_t)nanoseconds / 1000U;
+        }
+    }
+    pthread_mutex_lock(&aof->mutex);
+    if (target > aof->synced_sequence) aof->synced_sequence = target;
+    aof->fsync_count++;
+    aof->fsync_total_us += elapsed_us;
+    if (elapsed_us > aof->fsync_max_us) aof->fsync_max_us = elapsed_us;
+    pthread_cond_broadcast(&aof->condition);
+    pthread_mutex_unlock(&aof->mutex);
+    pthread_mutex_unlock(&aof->sync_mutex);
     return 0;
 }
 
 /* Called with mutex held. */
-static int consume_written(aof_t *aof, size_t amount)
+static uint64_t consume_written(aof_t *aof, size_t amount)
 {
+    uint64_t completed_sequence = 0;
+
     while (amount > 0) {
         aof_chunk_t *chunk = aof->queue_head;
         size_t available = chunk->length - chunk->offset;
@@ -276,22 +320,19 @@ static int consume_written(aof_t *aof, size_t amount)
             chunk->next = aof->free_chunks;
             aof->free_chunks = chunk;
             if (sequence_end) {
-                if (aof->fsync_policy == AOF_FSYNC_ALWAYS && sync_written(aof, sequence) != 0) return -1;
-                aof->written_sequence = sequence;
-                notify_reactor(aof);
+                completed_sequence = sequence;
             }
         }
     }
     if (aof->queue_bytes <= AOF_QUEUE_LOW_WATER) {
         aof->backpressured = 0;
     }
-    pthread_cond_broadcast(&aof->condition);
-    return 0;
+    return completed_sequence;
 }
 
 static void realtime_after_one_second(struct timespec *deadline)
 {
-    if (clock_gettime(CLOCK_REALTIME, deadline) != 0) {
+    if (clock_gettime(CLOCK_MONOTONIC, deadline) != 0) {
         deadline->tv_sec = 1; deadline->tv_nsec = 0;
     } else deadline->tv_sec++;
 }
@@ -309,23 +350,37 @@ static void *writer_main(void *context)
         size_t count = 0;
         aof_chunk_t *chunk;
         ssize_t result;
+        uint64_t completed_sequence;
 
         pthread_mutex_lock(&aof->mutex);
-        while (aof->queue_head == NULL && !aof->stopping) {
+        for (;;) {
+            while (aof->pause_requested && !aof->stopping) {
+                aof->paused = 1;
+                pthread_cond_broadcast(&aof->condition);
+                pthread_cond_wait(&aof->condition, &aof->mutex);
+            }
+            if (aof->paused) {
+                aof->paused = 0;
+                pthread_cond_broadcast(&aof->condition);
+            }
+            if (aof->queue_head != NULL || aof->stopping) break;
             if (aof->fsync_policy == AOF_FSYNC_EVERYSEC) {
                 struct timespec deadline;
                 int waited;
+
                 realtime_after_one_second(&deadline);
                 waited = pthread_cond_timedwait(&aof->condition, &aof->mutex, &deadline);
                 if (waited == ETIMEDOUT) {
                     uint64_t written = aof->written_sequence;
+
+                    pthread_mutex_unlock(&aof->mutex);
                     if (sync_written(aof, written) != 0) {
                         int saved_errno = errno;
 
-                        pthread_mutex_unlock(&aof->mutex);
                         publish_error(aof, saved_errno);
                         return NULL;
                     }
+                    pthread_mutex_lock(&aof->mutex);
                 }
             } else pthread_cond_wait(&aof->condition, &aof->mutex);
         }
@@ -342,27 +397,34 @@ static void *writer_main(void *context)
         if (result <= 0) { publish_error(aof, result == 0 ? EIO : errno); break; }
         pthread_mutex_lock(&aof->mutex);
         aof->written_bytes += (uint64_t)result;
-        if (consume_written(aof, (size_t)result) != 0) {
-            int saved_errno = errno;
-            pthread_mutex_unlock(&aof->mutex);
-            publish_error(aof, saved_errno);
-            return NULL;
-        }
+        completed_sequence = consume_written(aof, (size_t)result);
         pthread_mutex_unlock(&aof->mutex);
+        if (completed_sequence != 0) {
+            if (aof->fsync_policy == AOF_FSYNC_ALWAYS &&
+                sync_written(aof, completed_sequence) != 0) {
+                publish_error(aof, errno);
+                return NULL;
+            }
+            pthread_mutex_lock(&aof->mutex);
+            if (completed_sequence > aof->written_sequence)
+                aof->written_sequence = completed_sequence;
+            pthread_cond_broadcast(&aof->condition);
+            pthread_mutex_unlock(&aof->mutex);
+            notify_reactor(aof);
+        }
     }
     if (aof->fsync_policy == AOF_FSYNC_EVERYSEC) {
         uint64_t written;
 
         pthread_mutex_lock(&aof->mutex);
         written = aof->written_sequence;
+        pthread_mutex_unlock(&aof->mutex);
         if (sync_written(aof, written) != 0) {
             int saved_errno = errno;
 
-            pthread_mutex_unlock(&aof->mutex);
             publish_error(aof, saved_errno);
             return NULL;
         }
-        pthread_mutex_unlock(&aof->mutex);
     }
     return NULL;
 }
@@ -370,6 +432,8 @@ static void *writer_main(void *context)
 int aof_open(aof_t **out_aof, const char *path, aof_fsync_policy_t fsync_policy)
 {
     aof_t *aof;
+    pthread_condattr_t condition_attributes;
+    int condition_attributes_initialized = 0;
     int result;
 
     if (out_aof == NULL || path == NULL || path[0] == '\0' ||
@@ -385,11 +449,24 @@ int aof_open(aof_t **out_aof, const char *path, aof_fsync_policy_t fsync_policy)
     if (aof->fd < 0) { free(aof); return -1; }
     result = pthread_mutex_init(&aof->mutex, NULL);
     if (result != 0) { close(aof->fd); free(aof); errno = result; return -1; }
-    result = pthread_cond_init(&aof->condition, NULL);
-    if (result != 0) { pthread_mutex_destroy(&aof->mutex); close(aof->fd); free(aof); errno = result; return -1; }
+    result = pthread_mutex_init(&aof->sync_mutex, NULL);
+    if (result != 0) {
+        pthread_mutex_destroy(&aof->mutex);
+        close(aof->fd); free(aof); errno = result; return -1;
+    }
+    result = pthread_condattr_init(&condition_attributes);
+    if (result == 0) condition_attributes_initialized = 1;
+    if (result == 0)
+        result = pthread_condattr_setclock(&condition_attributes,
+                                           CLOCK_MONOTONIC);
+    if (result == 0)
+        result = pthread_cond_init(&aof->condition, &condition_attributes);
+    if (condition_attributes_initialized)
+        (void)pthread_condattr_destroy(&condition_attributes);
+    if (result != 0) { pthread_mutex_destroy(&aof->sync_mutex); pthread_mutex_destroy(&aof->mutex); close(aof->fd); free(aof); errno = result; return -1; }
     result = pthread_create(&aof->writer_thread, NULL, writer_main, aof);
     if (result != 0) {
-        pthread_cond_destroy(&aof->condition); pthread_mutex_destroy(&aof->mutex);
+        pthread_cond_destroy(&aof->condition); pthread_mutex_destroy(&aof->sync_mutex); pthread_mutex_destroy(&aof->mutex);
         close(aof->fd); free(aof); errno = result; return -1;
     }
     aof->writer_started = 1;
@@ -397,18 +474,22 @@ int aof_open(aof_t **out_aof, const char *path, aof_fsync_policy_t fsync_policy)
     return 0;
 }
 
-int aof_replay(aof_t *aof, aof_replay_callback callback, void *context,
-               aof_replay_stats_t *stats)
+int aof_replay_from(aof_t *aof, uint64_t offset,
+                    aof_replay_callback callback, void *context,
+                    aof_replay_stats_t *stats)
 {
     struct stat status;
     unsigned char *mapping;
-    size_t position = 0;
+    size_t position;
 
     if (aof == NULL || callback == NULL) { errno = EINVAL; return -1; }
     if (stats != NULL) memset(stats, 0, sizeof(*stats));
     if (fstat(aof->fd, &status) != 0) return -1;
-    if (status.st_size == 0) return 0;
+    if (status.st_size < 0 || (uintmax_t)status.st_size > SIZE_MAX ||
+        offset > (uint64_t)status.st_size) { errno = EINVAL; return -1; }
+    if (status.st_size == 0 || offset == (uint64_t)status.st_size) return 0;
     if ((uintmax_t)status.st_size > SIZE_MAX) { errno = EFBIG; return -1; }
+    position = (size_t)offset;
     mapping = mmap(NULL, (size_t)status.st_size, PROT_READ, MAP_PRIVATE, aof->fd, 0);
     if (mapping == MAP_FAILED) return -1;
     (void)madvise(mapping, (size_t)status.st_size, MADV_SEQUENTIAL);
@@ -441,6 +522,177 @@ int aof_replay(aof_t *aof, aof_replay_callback callback, void *context,
         if (stats != NULL) stats->truncated_tail_repaired = 1;
     }
     return 0;
+}
+
+int aof_replay(aof_t *aof, aof_replay_callback callback, void *context,
+               aof_replay_stats_t *stats)
+{
+    return aof_replay_from(aof, 0, callback, context, stats);
+}
+
+static void checkpoint_token_text(
+    const unsigned char token[RDB_CHECKPOINT_TOKEN_SIZE],
+    unsigned char output[RDB_CHECKPOINT_TOKEN_SIZE * 2U])
+{
+    static const unsigned char hex[] = "0123456789abcdef";
+    size_t index;
+
+    for (index = 0; index < RDB_CHECKPOINT_TOKEN_SIZE; ++index) {
+        output[index * 2U] = hex[token[index] >> 4U];
+        output[index * 2U + 1U] = hex[token[index] & 0x0fU];
+    }
+}
+
+static int fill_random_token(unsigned char *token, size_t length)
+{
+    size_t position = 0;
+
+    while (position < length) {
+        ssize_t result = getrandom(token + position, length - position, 0);
+
+        if (result > 0) position += (size_t)result;
+        else if (result < 0 && errno == EINTR) continue;
+        else return -1;
+    }
+    return 0;
+}
+
+static int checkpoint_record(const rdb_checkpoint_t *checkpoint,
+                             unsigned char *output,
+                             size_t capacity,
+                             size_t *length)
+{
+    unsigned char token_text[RDB_CHECKPOINT_TOKEN_SIZE * 2U];
+    aof_argument_t arguments[2];
+
+    checkpoint_token_text(checkpoint->token, token_text);
+    arguments[0].data = (const unsigned char *)"PING";
+    arguments[0].length = 4U;
+    arguments[1].data = token_text;
+    arguments[1].length = sizeof(token_text);
+    if (encoded_size(arguments, 2U, length) != 0 || *length > capacity)
+        return -1;
+    return encode_record(output, capacity, arguments, 2U, *length);
+}
+
+int aof_create_checkpoint(aof_t *aof, rdb_checkpoint_t *checkpoint)
+{
+    unsigned char token_text[RDB_CHECKPOINT_TOKEN_SIZE * 2U];
+    aof_argument_t arguments[2];
+    struct stat status;
+    uint64_t sequence = 0;
+    int error_number;
+
+    if (aof == NULL || checkpoint == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(checkpoint, 0, sizeof(*checkpoint));
+    if (fill_random_token(checkpoint->token, sizeof(checkpoint->token)) != 0)
+        return -1;
+    checkpoint_token_text(checkpoint->token, token_text);
+    arguments[0].data = (const unsigned char *)"PING";
+    arguments[0].length = 4U;
+    arguments[1].data = token_text;
+    arguments[1].length = sizeof(token_text);
+    if (aof_transaction_begin(aof) != 0 ||
+        aof_append(aof, arguments, 2U) != 0 ||
+        aof_transaction_commit(aof, &sequence) != 0) {
+        aof_transaction_rollback(aof);
+        return -1;
+    }
+    pthread_mutex_lock(&aof->mutex);
+    if (aof->producer_chunk != NULL) {
+        queue_chunk_locked(aof, aof->producer_chunk);
+        aof->producer_chunk = NULL;
+    }
+    while (aof->written_sequence < sequence && aof->async_error == 0) {
+        pthread_cond_wait(&aof->condition, &aof->mutex);
+    }
+    error_number = aof->async_error;
+    pthread_mutex_unlock(&aof->mutex);
+    if (error_number == 0 && sync_written(aof, sequence) != 0)
+        error_number = errno;
+    if (error_number != 0) {
+        errno = error_number;
+        return -1;
+    }
+    if (fstat(aof->fd, &status) != 0 || status.st_size < 0) return -1;
+    checkpoint->aof_offset = (uint64_t)status.st_size;
+    checkpoint->valid = 1;
+    return 0;
+}
+
+int aof_validate_checkpoint(aof_t *aof,
+                            const rdb_checkpoint_t *checkpoint)
+{
+    unsigned char expected[128];
+    unsigned char actual[128];
+    size_t length;
+    size_t position = 0;
+
+    if (aof == NULL || checkpoint == NULL || !checkpoint->valid ||
+        checkpoint_record(checkpoint, expected, sizeof(expected), &length) != 0 ||
+        checkpoint->aof_offset < length) {
+        errno = EINVAL;
+        return -1;
+    }
+    while (position < length) {
+        ssize_t result = pread(aof->fd,
+                               actual + position,
+                               length - position,
+                               (off_t)(checkpoint->aof_offset - length + position));
+
+        if (result > 0) position += (size_t)result;
+        else if (result < 0 && errno == EINTR) continue;
+        else {
+            if (result == 0) errno = EINVAL;
+            return -1;
+        }
+    }
+    if (memcmp(actual, expected, length) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+int aof_pause_for_fork(aof_t *aof)
+{
+    if (aof == NULL) return 0;
+    pthread_mutex_lock(&aof->mutex);
+    if (aof->pause_requested || aof->stopping || aof->async_error != 0) {
+        int error_number = aof->async_error != 0 ? aof->async_error : EBUSY;
+
+        pthread_mutex_unlock(&aof->mutex);
+        errno = error_number;
+        return -1;
+    }
+    aof->pause_requested = 1;
+    pthread_cond_broadcast(&aof->condition);
+    while (!aof->paused && aof->async_error == 0) {
+        pthread_cond_wait(&aof->condition, &aof->mutex);
+    }
+    if (aof->async_error != 0) {
+        int error_number = aof->async_error;
+
+        aof->pause_requested = 0;
+        pthread_cond_broadcast(&aof->condition);
+        pthread_mutex_unlock(&aof->mutex);
+        errno = error_number;
+        return -1;
+    }
+    pthread_mutex_unlock(&aof->mutex);
+    return 0;
+}
+
+void aof_resume_after_fork(aof_t *aof)
+{
+    if (aof == NULL) return;
+    pthread_mutex_lock(&aof->mutex);
+    aof->pause_requested = 0;
+    pthread_cond_broadcast(&aof->condition);
+    pthread_mutex_unlock(&aof->mutex);
 }
 
 int aof_append(aof_t *aof, const aof_argument_t *arguments, size_t argument_count)
@@ -611,6 +863,9 @@ void aof_get_info(aof_t *aof, aof_info_t *info)
     info->synced_sequence = aof->synced_sequence;
     info->written_bytes = aof->written_bytes;
     info->backpressure_events = aof->backpressure_events;
+    info->fsync_count = aof->fsync_count;
+    info->fsync_total_us = aof->fsync_total_us;
+    info->fsync_max_us = aof->fsync_max_us;
     info->backpressured = aof->backpressured;
     info->last_error = aof->async_error; info->failed = info->last_error != 0;
     pthread_mutex_unlock(&aof->mutex);
@@ -631,8 +886,13 @@ int aof_close(aof_t *aof)
     free(aof->producer_chunk);
     while ((chunk = aof->free_chunks) != NULL) { aof->free_chunks = chunk->next; free(chunk); }
     if (close(aof->fd) != 0 && result == 0) { result = -1; saved_errno = errno; }
-    pthread_cond_destroy(&aof->condition); pthread_mutex_destroy(&aof->mutex);
+    pthread_cond_destroy(&aof->condition); pthread_mutex_destroy(&aof->sync_mutex); pthread_mutex_destroy(&aof->mutex);
     free(aof->pending); free(aof->transaction); free(aof);
     if (result != 0) errno = saved_errno == 0 ? EIO : saved_errno;
     return result;
+}
+
+void aof_close_in_child(aof_t *aof)
+{
+    if (aof != NULL && aof->fd >= 0) (void)close(aof->fd);
 }
