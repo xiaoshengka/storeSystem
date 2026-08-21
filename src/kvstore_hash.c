@@ -15,11 +15,11 @@ typedef struct kv_hash_table {
 } kv_hash_table_t;
 
 struct kv_hash_node {
-    unsigned char *key;
     size_t key_length;
     uint64_t hash_code;
     void *payload;
     kv_hash_node_t *next;
+    unsigned char key[];
 };
 
 struct hashtable_s {
@@ -43,12 +43,34 @@ static int valid_bytes(const void *data, size_t length)
 static uint64_t hash_bytes(const void *key, size_t key_length)
 {
     const unsigned char *cursor = key;
-    size_t index;
-    uint64_t value = 5381U;
+    size_t index = 0;
+    const uint64_t prime = UINT64_C(1099511628211);
+    uint64_t lane0 = UINT64_C(14695981039346656037);
+    uint64_t lane1 = lane0 ^ UINT64_C(0x9e3779b185ebca87);
+    uint64_t lane2 = lane0 ^ UINT64_C(0xc2b2ae3d27d4eb4f);
+    uint64_t lane3 = lane0 ^ UINT64_C(0x165667b19e3779f9);
+    uint64_t value;
 
-    for (index = 0; index < key_length; ++index) {
-        value = ((value << 5U) + value) + cursor[index];
+    /* Four independent FNV lanes preserve byte-sensitive mixing while
+     * breaking the serial multiply chain for common 64-byte members. */
+    for (; index + 4U <= key_length; index += 4U) {
+        lane0 = (lane0 ^ cursor[index]) * prime;
+        lane1 = (lane1 ^ cursor[index + 1U]) * prime;
+        lane2 = (lane2 ^ cursor[index + 2U]) * prime;
+        lane3 = (lane3 ^ cursor[index + 3U]) * prime;
     }
+    for (; index < key_length; ++index) {
+        lane0 = (lane0 ^ cursor[index]) * prime;
+    }
+    value = lane0 ^ ((lane1 << 13U) | (lane1 >> 51U)) ^
+            ((lane2 << 29U) | (lane2 >> 35U)) ^
+            ((lane3 << 47U) | (lane3 >> 17U)) ^
+            ((uint64_t)key_length * UINT64_C(0x9e3779b185ebca87));
+    value ^= value >> 33U;
+    value *= UINT64_C(0xff51afd7ed558ccd);
+    value ^= value >> 33U;
+    value *= UINT64_C(0xc4ceb9fe1a85ec53);
+    value ^= value >> 33U;
     return value;
 }
 
@@ -65,16 +87,10 @@ static unsigned char *copy_bytes(const void *data, size_t length)
 {
     unsigned char *copy;
 
-    if (!valid_bytes(data, length) || length == SIZE_MAX) {
-        return NULL;
-    }
+    if (!valid_bytes(data, length) || length == SIZE_MAX) return NULL;
     copy = malloc(length + 1U);
-    if (copy == NULL) {
-        return NULL;
-    }
-    if (length > 0) {
-        memcpy(copy, data, length);
-    }
+    if (copy == NULL) return NULL;
+    if (length > 0) memcpy(copy, data, length);
     copy[length] = '\0';
     return copy;
 }
@@ -123,7 +139,6 @@ static void hash_clear(hashtable_t *hash,
                 if (destroy_payload != NULL) {
                     destroy_payload(node->payload);
                 }
-                free(node->key);
                 free(node);
                 node = next;
             }
@@ -180,7 +195,7 @@ static kv_hash_node_t *find_in_table(kv_hash_table_t *table,
     if (table->slots == 0) {
         return NULL;
     }
-    bucket = (size_t)(hash_code % table->slots);
+    bucket = (size_t)(hash_code & (uint64_t)(table->slots - 1U));
     node = table->buckets[bucket];
     while (node != NULL) {
         if (key_equals(node, key, key_length, hash_code)) {
@@ -206,7 +221,8 @@ static void *remove_target(hashtable_t *hash, kv_hash_node_t *target)
         if (table->slots == 0) {
             continue;
         }
-        bucket = (size_t)(target->hash_code % table->slots);
+        bucket = (size_t)(target->hash_code &
+                          (uint64_t)(table->slots - 1U));
         link = &table->buckets[bucket];
         while (*link != NULL && *link != target) {
             link = &(*link)->next;
@@ -215,7 +231,6 @@ static void *remove_target(hashtable_t *hash, kv_hash_node_t *target)
             void *payload = target->payload;
 
             *link = target->next;
-            free(target->key);
             free(target);
             hash->count--;
             return payload;
@@ -277,30 +292,36 @@ int kv_hash_insert(hashtable_t *hash,
 {
     kv_hash_node_t *node;
     kv_hash_table_t *destination;
+    uint64_t hash_code;
     size_t bucket;
 
     if (out_node != NULL) {
         *out_node = NULL;
     }
-    if (hash == NULL || !valid_bytes(key, key_length) ||
-        kv_hash_find(hash, key, key_length) != NULL || maybe_expand(hash) != 0) {
+    if (hash == NULL || !valid_bytes(key, key_length) || key_length == SIZE_MAX) {
         return -1;
     }
-    node = calloc(1, sizeof(*node));
+    hash_code = hash_bytes(key, key_length);
+    if (find_in_table(&hash->tables[0], key, key_length, hash_code) != NULL ||
+        (kv_hash_is_rehashing(hash) &&
+         find_in_table(&hash->tables[1], key, key_length, hash_code) != NULL) ||
+        maybe_expand(hash) != 0 ||
+        sizeof(*node) > SIZE_MAX - key_length - 1U) {
+        return -1;
+    }
+    node = calloc(1, sizeof(*node) + key_length + 1U);
     if (node == NULL) {
         return -1;
     }
-    node->key = copy_bytes(key, key_length);
-    if (node->key == NULL) {
-        free(node);
-        return -1;
-    }
+    if (key_length > 0) memcpy(node->key, key, key_length);
+    node->key[key_length] = '\0';
     node->key_length = key_length;
-    node->hash_code = hash_bytes(key, key_length);
+    node->hash_code = hash_code;
     node->payload = payload;
     destination = kv_hash_is_rehashing(hash) ? &hash->tables[1]
                                              : &hash->tables[0];
-    bucket = (size_t)(node->hash_code % destination->slots);
+    bucket = (size_t)(node->hash_code &
+                      (uint64_t)(destination->slots - 1U));
     node->next = destination->buckets[bucket];
     destination->buckets[bucket] = node;
     hash->count++;
@@ -389,18 +410,29 @@ int kv_hash_is_rehashing(const hashtable_t *hash)
 
 size_t kv_hash_rehash_step(hashtable_t *hash, size_t bucket_budget)
 {
+    size_t empty_budget;
     size_t moved = 0;
 
     if (hash == NULL || !kv_hash_is_rehashing(hash)) {
         return 0;
     }
+    empty_budget = bucket_budget > SIZE_MAX / 10U
+                       ? SIZE_MAX
+                       : bucket_budget * 10U;
     while (bucket_budget > 0 && hash->rehash_index < hash->tables[0].slots) {
         kv_hash_node_t *node = hash->tables[0].buckets[hash->rehash_index];
+
+        if (node == NULL && empty_budget > 0) {
+            hash->rehash_index++;
+            empty_budget--;
+            continue;
+        }
 
         hash->tables[0].buckets[hash->rehash_index] = NULL;
         while (node != NULL) {
             kv_hash_node_t *next = node->next;
-            size_t bucket = (size_t)(node->hash_code % hash->tables[1].slots);
+            size_t bucket = (size_t)(node->hash_code &
+                                     (uint64_t)(hash->tables[1].slots - 1U));
 
             node->next = hash->tables[1].buckets[bucket];
             hash->tables[1].buckets[bucket] = node;

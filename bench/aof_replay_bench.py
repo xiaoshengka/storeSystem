@@ -1,69 +1,58 @@
 #!/usr/bin/env python3
-"""Generate deterministic AOF files and measure kvstore cold-start replay."""
+"""Benchmark deterministic String/Hash/ZSet RESP2 AOF replay against Redis 6.2.23."""
 
 import argparse
 import csv
 import math
-import os
 import re
+import shutil
 import signal
 import socket
+import statistics
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List
 
 
-HOST = "127.0.0.1"
-PORT = 9096
-REPLAY_SECONDS = re.compile(r"^aof_replay_duration_seconds: ([0-9.]+)$", re.M)
-REPLAY_COMMANDS = re.compile(r"^aof_replay_commands: ([0-9]+)$", re.M)
+PROJECT_REPLAY = re.compile(r"^aof_replay_duration_seconds: ([0-9.]+)$", re.M)
+PROJECT_COMMANDS = re.compile(r"^aof_replay_commands: ([0-9]+)$", re.M)
+REDIS_REPLAY = re.compile(r"DB loaded from append only file: ([0-9.]+) seconds")
+TARGETS = ("project-skiplist", "project-rbtree", "redis")
+WORKLOADS = ("string", "hash", "zset")
+VALUE = b"x" * 64
 
 
-def parse_sizes(text: str) -> List[int]:
-    result = []
-    for item in text.split(","):
-        try:
-            value = int(item)
-        except ValueError as error:
-            raise argparse.ArgumentTypeError("sizes must be comma-separated integers") from error
-        if value <= 0:
-            raise argparse.ArgumentTypeError("all sizes must be positive")
-        result.append(value)
-    if not result:
-        raise argparse.ArgumentTypeError("at least one size is required")
-    return result
+def comma_values(text, cast=str):
+    try:
+        values = tuple(dict.fromkeys(cast(item.strip()) for item in text.split(",")))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("invalid comma-separated value") from error
+    if not values:
+        raise argparse.ArgumentTypeError("at least one value is required")
+    return values
 
 
-def percentile(values: List[float], quantile: float) -> float:
-    ordered = sorted(values)
-    index = max(0, math.ceil(quantile * len(ordered)) - 1)
-    return ordered[index]
-
-
-def encode_set(index: int, value: bytes) -> bytes:
-    key = f"replay:{index}".encode("ascii")
-    return (
-        b"*3\r\n$3\r\nSET\r\n$"
-        + str(len(key)).encode("ascii")
-        + b"\r\n"
-        + key
-        + b"\r\n$"
-        + str(len(value)).encode("ascii")
-        + b"\r\n"
-        + value
-        + b"\r\n"
+def resp(*parts: bytes) -> bytes:
+    return b"*%d\r\n" % len(parts) + b"".join(
+        b"$%d\r\n" % len(part) + part + b"\r\n" for part in parts
     )
 
 
-def generate_aof(path: Path, command_count: int, value_size: int) -> int:
-    value = b"x" * value_size
+def command(workload: str, index: int) -> bytes:
+    if workload == "string":
+        return resp(b"SET", f"replay:string:{index}".encode(), VALUE)
+    if workload == "hash":
+        return resp(b"HSET", b"replay:hash", f"field:{index}".encode(), VALUE)
+    return resp(b"ZADD", b"replay:zset", str(index).encode(),
+                f"member:{index}".encode())
+
+
+def generate(path: Path, workload: str, count: int) -> int:
     pending = bytearray()
     with path.open("wb") as output:
-        for index in range(command_count):
-            pending.extend(encode_set(index, value))
+        for index in range(count):
+            pending.extend(command(workload, index))
             if len(pending) >= 1024 * 1024:
                 output.write(pending)
                 pending.clear()
@@ -72,175 +61,266 @@ def generate_aof(path: Path, command_count: int, value_size: int) -> int:
     return path.stat().st_size
 
 
-def port_is_open() -> bool:
+def read_line(stream) -> bytes:
+    line = stream.readline()
+    if not line.endswith(b"\r\n"):
+        raise RuntimeError("incomplete RESP line")
+    return line[:-2]
+
+
+def request(port: int, *parts: bytes, timeout: float = 10.0):
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as client:
+        client.settimeout(timeout)
+        client.sendall(resp(*parts))
+        stream = client.makefile("rb")
+        line = read_line(stream)
+        if line[:1] == b":":
+            return int(line[1:])
+        if line[:1] == b"$":
+            length = int(line[1:])
+            if length < 0:
+                return None
+            payload = stream.read(length)
+            if len(payload) != length or stream.read(2) != b"\r\n":
+                raise RuntimeError("incomplete bulk response")
+            return payload
+        if line[:1] == b"-":
+            raise RuntimeError(line[1:].decode(errors="replace"))
+        return line[1:] if line[:1] == b"+" else line
+
+
+def verify(port: int, workload: str, count: int) -> None:
+    expected_keys = count if workload == "string" else 1
+    if request(port, b"DBSIZE") != expected_keys:
+        raise RuntimeError("DBSIZE mismatch")
+    if workload == "string":
+        for index in (0, count - 1):
+            if request(port, b"GET", f"replay:string:{index}".encode()) != VALUE:
+                raise RuntimeError("GET validation failed")
+    elif workload == "hash":
+        if request(port, b"HLEN", b"replay:hash") != count:
+            raise RuntimeError("HLEN mismatch")
+        for index in (0, count - 1):
+            if request(port, b"HGET", b"replay:hash",
+                       f"field:{index}".encode()) != VALUE:
+                raise RuntimeError("HGET validation failed")
+    else:
+        if request(port, b"ZCARD", b"replay:zset") != count:
+            raise RuntimeError("ZCARD mismatch")
+        for index in (0, count - 1):
+            value = request(port, b"ZSCORE", b"replay:zset",
+                            f"member:{index}".encode())
+            if value is None or float(value) != float(index):
+                raise RuntimeError("ZSCORE validation failed")
+
+
+def port_open(port: int) -> bool:
     try:
-        with socket.create_connection((HOST, PORT), timeout=0.1):
+        with socket.create_connection(("127.0.0.1", port), timeout=0.05):
             return True
     except OSError:
         return False
 
 
-def wait_until_ready(
-    process: subprocess.Popen,
-    timeout: float,
-    start: float,
-) -> float:
+def wait_ready(process, port: int, start: float, timeout: float) -> float:
     deadline = start + timeout
+    last_error = None
     while time.perf_counter() < deadline:
         if process.poll() is not None:
             stdout, stderr = process.communicate()
-            raise RuntimeError(
-                f"server exited with status {process.returncode}\n{stdout}\n{stderr}"
-            )
-        if port_is_open():
-            return time.perf_counter() - start
+            raise RuntimeError(f"server exited {process.returncode}\n{stdout}\n{stderr}")
+        try:
+            remaining = max(0.01, deadline - time.perf_counter())
+            if request(port, b"PING", timeout=min(0.2, remaining)) == b"PONG":
+                return time.perf_counter() - start
+            last_error = RuntimeError("PING did not return PONG")
+        except (OSError, RuntimeError) as error:
+            # Redis starts accepting TCP connections while an AOF is still
+            # being replayed and replies with LOADING until commands are safe.
+            last_error = error
         time.sleep(0.005)
     process.kill()
     stdout, stderr = process.communicate()
-    raise TimeoutError(f"server did not become ready\n{stdout}\n{stderr}")
-
-
-def peak_rss_kib(pid: int) -> int:
-    try:
-        status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
-    except OSError:
-        return 0
-    match = re.search(r"^VmHWM:\s+([0-9]+)\s+kB$", status, re.M)
-    return int(match.group(1)) if match else 0
-
-
-def run_once(server: str, aof_path: Path, timeout: float) -> Dict[str, float]:
-    command = [
-        server,
-        "--appendonly", "yes",
-        "--appendfilename", str(aof_path),
-        "--appendfsync", "no",
-        "--maxmemory", "0",
-        "--maxkeys", "0",
-    ]
-    startup_start = time.perf_counter()
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    raise TimeoutError(
+        f"server not command-ready; last readiness error: {last_error}\n"
+        f"{stdout}\n{stderr}"
     )
+
+
+def process_metrics(pid: int):
+    rss = 0
+    cpu = 0.0
     try:
-        ready_seconds = wait_until_ready(process, timeout, startup_start)
-        rss_kib = peak_rss_kib(process.pid)
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                rss = int(line.split()[1])
+        fields = Path(f"/proc/{pid}/stat").read_text().split()
+        cpu = (int(fields[13]) + int(fields[14])) / 100.0
+    except OSError:
+        pass
+    return cpu, rss
+
+
+def server_command(target: str, args, aof: Path, port: int):
+    if target == "redis":
+        return [args.redis_server, "--port", str(port), "--save", "",
+                "--appendonly", "yes", "--appendfsync", "no",
+                "--auto-aof-rewrite-percentage", "0", "--dir", str(aof.parent),
+                "--appendfilename", aof.name]
+    engine = "skiplist" if target.endswith("skiplist") else "rbtree"
+    return [args.server, "--appendonly", "yes", "--appendfilename", str(aof),
+            "--appendfsync", "no", "--zset-engine", engine,
+            "--maxmemory", "0", "--maxkeys", "0"]
+
+
+def run_once(target: str, workload: str, count: int, source: Path,
+             args, run_dir: Path):
+    port = 6380 if target == "redis" else 9096
+    aof = run_dir / "appendonly.aof"
+    shutil.copyfile(source, aof)
+    started = time.perf_counter()
+    process = subprocess.Popen(server_command(target, args, aof, port),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True)
+    try:
+        ready = wait_ready(process, port, started, args.timeout)
+        verify(port, workload, count)
+        cpu, rss = process_metrics(process.pid)
         process.send_signal(signal.SIGTERM)
-        stdout, stderr = process.communicate(timeout=10.0)
+        stdout, stderr = process.communicate(timeout=15.0)
     except BaseException:
         if process.poll() is None:
             process.kill()
             process.communicate()
         raise
     if process.returncode != 0:
-        raise RuntimeError(
-            f"server stopped with status {process.returncode}\n{stdout}\n{stderr}"
-        )
-    replay_match = REPLAY_SECONDS.search(stderr)
-    commands_match = REPLAY_COMMANDS.search(stderr)
-    if replay_match is None or commands_match is None:
-        raise RuntimeError(f"missing replay metrics in server log\n{stdout}\n{stderr}")
-    return {
-        "startup_ready_seconds": ready_seconds,
-        "replay_seconds": float(replay_match.group(1)),
-        "commands_loaded": int(commands_match.group(1)),
-        "peak_rss_kib": rss_kib,
-    }
+        raise RuntimeError(f"server stopped {process.returncode}\n{stdout}\n{stderr}")
+    if target == "redis":
+        match = REDIS_REPLAY.search(stdout + "\n" + stderr)
+        commands_loaded = count
+    else:
+        match = PROJECT_REPLAY.search(stderr)
+        loaded = PROJECT_COMMANDS.search(stderr)
+        commands_loaded = int(loaded.group(1)) if loaded else -1
+    if match is None or commands_loaded != count:
+        raise RuntimeError(f"missing/invalid replay metrics\n{stdout}\n{stderr}")
+    return ready, float(match.group(1)), cpu, rss
 
 
-def write_csv(path: Path, rows: List[Dict[str, object]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as output:
-        writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+def percentile(values, q: float):
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
+
+
+def cv(values):
+    mean = statistics.mean(values)
+    return 0.0 if mean == 0 or len(values) < 2 else statistics.stdev(values) / mean
+
+
+def verify_redis(parser, executable):
+    try:
+        result = subprocess.run([executable, "--version"], check=True,
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as error:
+        parser.error(f"cannot run Redis: {error}")
+    version = (result.stdout or result.stderr).strip()
+    if "v=6.2.23" not in version:
+        parser.error(f"Redis 6.2.23 required; got {version}")
+    return version
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", default="./kvstore", help="kvstore executable")
-    parser.add_argument(
-        "--sizes",
-        type=parse_sizes,
-        default=parse_sizes("10000,100000,1000000"),
-        help="comma-separated AOF command counts",
-    )
-    parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--value-size", type=int, default=64)
-    parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--csv", type=Path, help="optional raw-result CSV path")
-    parser.add_argument("--aof-dir", type=Path, help="keep/generated AOF directory")
-    arguments = parser.parse_args()
+    parser.add_argument("--server", default="./kvstore")
+    parser.add_argument("--redis-server")
+    parser.add_argument("--targets", default=",".join(TARGETS))
+    parser.add_argument("--workloads", default=",".join(WORKLOADS))
+    parser.add_argument("--sizes", default="10000,100000,1000000")
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument("--csv", type=Path, required=True)
+    parser.add_argument("--summary-csv", type=Path)
+    parser.add_argument("--aof-dir", type=Path)
+    args = parser.parse_args()
+    targets = comma_values(args.targets)
+    workloads = comma_values(args.workloads)
+    sizes = comma_values(args.sizes, int)
+    if any(value not in TARGETS for value in targets): parser.error("unknown target")
+    if any(value not in WORKLOADS for value in workloads): parser.error("unknown workload")
+    if any(value <= 0 for value in sizes) or args.repeats < 1 or args.timeout <= 0:
+        parser.error("sizes must be positive, repeats >= 1, timeout > 0")
+    if "redis" in targets:
+        if not args.redis_server: parser.error("--redis-server is required")
+        print(f"redis: {verify_redis(parser, args.redis_server)}")
+    for port in (9096, 6380):
+        if port_open(port): parser.error(f"port {port} is already in use")
 
-    if arguments.repeats <= 0 or arguments.value_size < 0 or arguments.value_size > 60000:
-        parser.error("repeats must be positive and value-size must be in 0..60000")
-    if port_is_open():
-        parser.error("port 9096 is already in use; stop the running kvstore first")
-    if not Path(arguments.server).is_file():
-        parser.error(f"server executable not found: {arguments.server}")
-
+    summary_path = args.summary_csv or args.csv.with_suffix(args.csv.suffix + ".summary.csv")
     temporary = None
-    if arguments.aof_dir is None:
-        temporary = tempfile.TemporaryDirectory(prefix="storeSystem-replay-bench-")
-        aof_directory = Path(temporary.name)
+    if args.aof_dir is None:
+        temporary = tempfile.TemporaryDirectory(prefix="aof-replay-")
+        root = Path(temporary.name)
     else:
-        aof_directory = arguments.aof_dir
-        aof_directory.mkdir(parents=True, exist_ok=True)
-
-    rows: List[Dict[str, object]] = []
+        root = args.aof_dir
+        root.mkdir(parents=True, exist_ok=True)
+    rows = []
     try:
-        for command_count in arguments.sizes:
-            aof_path = aof_directory / f"replay-{command_count}.aof"
-            aof_bytes = generate_aof(aof_path, command_count, arguments.value_size)
-            print(f"generated commands={command_count} bytes={aof_bytes}")
-            size_rows = []
-            for run in range(1, arguments.repeats + 1):
-                metrics = run_once(arguments.server, aof_path, arguments.timeout)
-                if metrics["commands_loaded"] != command_count:
-                    raise RuntimeError(
-                        f"expected {command_count} commands, loaded {metrics['commands_loaded']}"
-                    )
-                replay_seconds = metrics["replay_seconds"]
-                row: Dict[str, object] = {
-                    "commands": command_count,
-                    "aof_bytes": aof_bytes,
-                    "value_bytes": arguments.value_size,
-                    "run": run,
-                    "replay_seconds": f"{replay_seconds:.9f}",
-                    "startup_ready_seconds": f"{metrics['startup_ready_seconds']:.9f}",
-                    "commands_per_second": f"{command_count / replay_seconds:.2f}",
-                    "mib_per_second": f"{aof_bytes / replay_seconds / (1024 * 1024):.2f}",
-                    "peak_rss_kib": int(metrics["peak_rss_kib"]),
-                }
-                rows.append(row)
-                size_rows.append(metrics)
-                print(
-                    f"run={run} replay={replay_seconds:.6f}s "
-                    f"ready={metrics['startup_ready_seconds']:.6f}s "
-                    f"rate={command_count / replay_seconds:.2f} cmd/s "
-                    f"peak_rss={int(metrics['peak_rss_kib'])} KiB"
+        for workload in workloads:
+            for count in sizes:
+                source = root / f"{workload}-{count}.aof"
+                aof_bytes = generate(source, workload, count)
+                selected_targets = targets if workload == "zset" else tuple(
+                    target for target in targets if target != "project-rbtree"
                 )
-            replay_values = [float(item["replay_seconds"]) for item in size_rows]
-            ready_values = [float(item["startup_ready_seconds"]) for item in size_rows]
-            print(
-                "summary "
-                f"commands={command_count} "
-                f"replay_min={min(replay_values):.6f}s "
-                f"replay_p50={percentile(replay_values, 0.50):.6f}s "
-                f"replay_p95={percentile(replay_values, 0.95):.6f}s "
-                f"replay_max={max(replay_values):.6f}s "
-                f"ready_p50={percentile(ready_values, 0.50):.6f}s"
-            )
+                for target in selected_targets:
+                    for run in range(1, args.repeats + 1):
+                        run_dir = root / f"run-{target}-{workload}-{count}-{run}"
+                        run_dir.mkdir(exist_ok=True)
+                        ready, replay, cpu, rss = run_once(
+                            target, workload, count, source, args, run_dir)
+                        row = {
+                            "target": target, "workload": workload,
+                            "commands": count, "run": run,
+                            "page_cache_group": "first" if run == 1 else "subsequent",
+                            "aof_bytes": aof_bytes,
+                            "startup_ready_seconds": f"{ready:.9f}",
+                            "replay_seconds": f"{replay:.9f}",
+                            "commands_per_second": f"{count / replay:.2f}",
+                            "mib_per_second": f"{aof_bytes / replay / 1048576:.2f}",
+                            "cpu_seconds": f"{cpu:.6f}",
+                            "vmhwm_kib": rss,
+                            "cardinality_valid": 1,
+                        }
+                        rows.append(row)
+                        print(f"target={target} workload={workload} commands={count} "
+                              f"run={run} replay={replay:.6f}s ready={ready:.6f}s")
+        args.csv.parent.mkdir(parents=True, exist_ok=True)
+        with args.csv.open("w", newline="") as output:
+            writer = csv.DictWriter(output, fieldnames=list(rows[0]))
+            writer.writeheader(); writer.writerows(rows)
+        groups = {}
+        for row in rows:
+            key = (row["target"], row["workload"], row["commands"],
+                   row["page_cache_group"])
+            groups.setdefault(key, []).append(float(row["replay_seconds"]))
+        summary_rows = []
+        for key, values in sorted(groups.items()):
+            target, workload, count, cache_group = key
+            summary_rows.append({
+                "target": target, "workload": workload, "commands": count,
+                "page_cache_group": cache_group, "runs": len(values),
+                "replay_min_seconds": min(values),
+                "replay_median_seconds": statistics.median(values),
+                "replay_p95_seconds": percentile(values, .95),
+                "replay_max_seconds": max(values), "replay_cv": cv(values),
+            })
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with summary_path.open("w", newline="") as output:
+            writer = csv.DictWriter(output, fieldnames=list(summary_rows[0]))
+            writer.writeheader(); writer.writerows(summary_rows)
+        print(f"raw csv: {args.csv}\nsummary csv: {summary_path}")
     finally:
-        if temporary is not None:
-            temporary.cleanup()
-
-    if arguments.csv is not None and rows:
-        write_csv(arguments.csv, rows)
-        print(f"csv: {arguments.csv}")
+        if temporary is not None: temporary.cleanup()
     return 0
 
 

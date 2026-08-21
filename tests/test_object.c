@@ -11,6 +11,25 @@ typedef struct range_result {
     size_t count;
 } range_result_t;
 
+static void test_string_object(void)
+{
+    static const unsigned char binary[] = {'a', 0, 'b', 'c'};
+    kv_object_t *object;
+    const void *value;
+    size_t length;
+    size_t memory;
+
+    assert(kv_object_create_string(&object, "initial", 7U) == 0);
+    memory = kv_object_memory_usage(object);
+    assert(kv_object_string_update(object, binary, sizeof(binary)) == 1);
+    value = kv_object_string_value(object, &length);
+    assert(length == sizeof(binary));
+    assert(memcmp(value, binary, sizeof(binary)) == 0);
+    assert(kv_object_memory_usage(object) == memory);
+    assert(kv_object_string_update(object, "too-large", 9U) == 0);
+    kv_object_destroy(object);
+}
+
 static int collect_member(const void *member,
                           size_t member_length,
                           double score,
@@ -150,6 +169,7 @@ static void test_zset_update_stress(kv_zset_engine_t engine)
 
 int main(void)
 {
+    test_string_object();
     test_hash_object();
     test_zset_engine(KV_ZSET_SKIPLIST);
     test_zset_engine(KV_ZSET_RBTREE);

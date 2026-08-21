@@ -1,0 +1,220 @@
+{
+  "passed": false,
+  "zset_winner": "skiplist",
+  "zset_geomean_qps": {
+    "skiplist": 1005158.8287104556,
+    "rbtree": 999316.6042622806
+  },
+  "zset_relative_difference": 0.005812240097090008,
+  "checks": [
+    {
+      "workload": "string-mixed",
+      "pipeline": 16,
+      "policy": "off",
+      "scenario": "normal",
+      "passed": true,
+      "project_qps": 803838.45,
+      "redis_qps": 737308.15,
+      "project_p99_us": 965.139,
+      "redis_p99_us": 1308.138
+    },
+    {
+      "workload": "string-mixed",
+      "pipeline": 16,
+      "policy": "everysec",
+      "scenario": "normal",
+      "passed": true,
+      "project_qps": 745724.37,
+      "redis_qps": 697389.28,
+      "project_p99_us": 846.701,
+      "redis_p99_us": 1376.849
+    },
+    {
+      "workload": "string-mixed",
+      "pipeline": 16,
+      "policy": "everysec",
+      "scenario": "bgsave",
+      "passed": true,
+      "project_qps": 750896.47,
+      "redis_qps": 693494.62,
+      "project_p99_us": 852.426,
+      "redis_p99_us": 1380.851
+    },
+    {
+      "workload": "string-mixed",
+      "pipeline": 64,
+      "policy": "off",
+      "scenario": "normal",
+      "passed": true,
+      "project_qps": 1869993.88,
+      "redis_qps": 1503828.65,
+      "project_p99_us": 1680.544,
+      "redis_p99_us": 2474.326
+    },
+    {
+      "workload": "string-mixed",
+      "pipeline": 64,
+      "policy": "everysec",
+      "scenario": "normal",
+      "passed": true,
+      "project_qps": 1767973.42,
+      "redis_qps": 1405998.36,
+      "project_p99_us": 1441.808,
+      "redis_p99_us": 2661.122
+    },
+    {
+      "workload": "string-mixed",
+      "pipeline": 64,
+      "policy": "everysec",
+      "scenario": "bgsave",
+      "passed": true,
+      "project_qps": 1738315.3,
+      "redis_qps": 1392233.68,
+      "project_p99_us": 1578.562,
+      "redis_p99_us": 2698.121
+    },
+    {
+      "workload": "hash-mixed",
+      "pipeline": 16,
+      "policy": "off",
+      "scenario": "normal",
+      "passed": false,
+      "project_qps": 813651.69,
+      "redis_qps": 835321.42,
+      "project_p99_us": 984.22,
+      "redis_p99_us": 1053.549
+    },
+    {
+      "workload": "hash-mixed",
+      "pipeline": 16,
+      "policy": "everysec",
+      "scenario": "normal",
+      "passed": false,
+      "project_qps": 717059.1,
+      "redis_qps": 775495.46,
+      "project_p99_us": 1109.793,
+      "redis_p99_us": 1124.578
+    },
+    {
+      "workload": "hash-mixed",
+      "pipeline": 16,
+      "policy": "everysec",
+      "scenario": "bgsave",
+      "passed": false,
+      "project_qps": 723447.26,
+      "redis_qps": 774665.64,
+      "project_p99_us": 1106.364,
+      "redis_p99_us": 1131.724
+    },
+    {
+      "workload": "hash-mixed",
+      "pipeline": 64,
+      "policy": "off",
+      "scenario": "normal",
+      "passed": true,
+      "project_qps": 1301316.57,
+      "redis_qps": 1191994.12,
+      "project_p99_us": 2644.756,
+      "redis_p99_us": 3721.698
+    },
+    {
+      "workload": "hash-mixed",
+      "pipeline": 64,
+      "policy": "everysec",
+      "scenario": "normal",
+      "passed": true,
+      "project_qps": 1225108.08,
+      "redis_qps": 1166462.6,
+      "project_p99_us": 2801.689,
+      "redis_p99_us": 3990.955
+    },
+    {
+      "workload": "hash-mixed",
+      "pipeline": 64,
+      "policy": "everysec",
+      "scenario": "bgsave",
+      "passed": true,
+      "project_qps": 1207516.7,
+      "redis_qps": 1166533.49,
+      "project_p99_us": 2823.045,
+      "redis_p99_us": 3965.535
+    },
+    {
+      "workload": "zset-mixed",
+      "pipeline": 16,
+      "policy": "off",
+      "scenario": "normal",
+      "passed": true,
+      "project_qps": 740988.4,
+      "redis_qps": 631443.04,
+      "project_p99_us": 1001.545,
+      "redis_p99_us": 1308.072
+    },
+    {
+      "workload": "zset-mixed",
+      "pipeline": 16,
+      "policy": "everysec",
+      "scenario": "normal",
+      "passed": true,
+      "project_qps": 731462.04,
+      "redis_qps": 626360.24,
+      "project_p99_us": 1276.584,
+      "redis_p99_us": 1298.632
+    },
+    {
+      "workload": "zset-mixed",
+      "pipeline": 16,
+      "policy": "everysec",
+      "scenario": "bgsave",
+      "passed": true,
+      "project_qps": 720854.63,
+      "redis_qps": 624108.35,
+      "project_p99_us": 1291.443,
+      "redis_p99_us": 1302.053
+    },
+    {
+      "workload": "zset-mixed",
+      "pipeline": 64,
+      "policy": "off",
+      "scenario": "normal",
+      "passed": true,
+      "project_qps": 1373887.81,
+      "redis_qps": 948233.92,
+      "project_p99_us": 2787.439,
+      "redis_p99_us": 3667.287
+    },
+    {
+      "workload": "zset-mixed",
+      "pipeline": 64,
+      "policy": "everysec",
+      "scenario": "normal",
+      "passed": true,
+      "project_qps": 1370832.19,
+      "redis_qps": 935250.98,
+      "project_p99_us": 2996.968,
+      "redis_p99_us": 3721.198
+    },
+    {
+      "workload": "zset-mixed",
+      "pipeline": 64,
+      "policy": "everysec",
+      "scenario": "bgsave",
+      "passed": true,
+      "project_qps": 1370283.46,
+      "redis_qps": 938899.45,
+      "project_p99_us": 2928.328,
+      "redis_p99_us": 3718.286
+    }
+  ],
+  "failures": [
+    "string-mixed/P16: everysec QPS loss 7.23%",
+    "string-mixed/P64: everysec QPS loss 5.46%",
+    "hash-mixed/P16/off: project must have QPS >= Redis and P99 <= Redis",
+    "hash-mixed/P16/everysec: project must have QPS >= Redis and P99 <= Redis",
+    "hash-mixed/P16: everysec QPS loss 11.87%",
+    "hash-mixed/P16: everysec P99 growth 12.76%",
+    "hash-mixed/P16/BGSAVE: project must have QPS >= Redis and P99 <= Redis",
+    "hash-mixed/P64: everysec QPS loss 5.86%",
+    "zset-mixed/P16: everysec P99 growth 27.46%"
+  ]
+}

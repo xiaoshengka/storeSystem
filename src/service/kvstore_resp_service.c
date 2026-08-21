@@ -26,6 +26,10 @@ static const unsigned char error_wrongtype[] =
 static const unsigned char error_float[] = "ERR value is not a valid float";
 static const unsigned char error_response_too_large[] =
     "ERR response exceeds 1 MiB limit";
+static const unsigned char error_rdb_disabled[] = "ERR RDB persistence disabled";
+static const unsigned char error_save_busy[] =
+    "ERR Background save already in progress";
+static const unsigned char reply_bgsave_started[] = "Background saving started";
 
 #define SERVICE_MAX_RESPONSE (1024U * 1024U)
 #define SERVICE_MAX_ARRAY_ELEMENTS 65536U
@@ -41,6 +45,7 @@ enum service_command {
     SERVICE_COMMAND_PTTL,
     SERVICE_COMMAND_PERSIST,
     SERVICE_COMMAND_INFO,
+    SERVICE_COMMAND_DBSIZE,
     SERVICE_COMMAND_HSET,
     SERVICE_COMMAND_HGET,
     SERVICE_COMMAND_HDEL,
@@ -51,6 +56,9 @@ enum service_command {
     SERVICE_COMMAND_ZSCORE,
     SERVICE_COMMAND_ZCARD,
     SERVICE_COMMAND_ZRANGE,
+    SERVICE_COMMAND_SAVE,
+    SERVICE_COMMAND_BGSAVE,
+    SERVICE_COMMAND_LASTSAVE,
     SERVICE_COMMAND_UNKNOWN
 };
 
@@ -62,9 +70,10 @@ static unsigned char ascii_upper(unsigned char value)
     return value;
 }
 
-static int argument_equals(const kvstore_argument_t *argument, const char *name)
+static int argument_equals_length(const kvstore_argument_t *argument,
+                                  const char *name,
+                                  size_t length)
 {
-    size_t length = strlen(name);
     size_t index;
 
     if (argument->length != length) {
@@ -78,28 +87,51 @@ static int argument_equals(const kvstore_argument_t *argument, const char *name)
     return 1;
 }
 
+#define argument_equals(argument, literal) \
+    argument_equals_length((argument), (literal), sizeof(literal) - 1U)
+
 static enum service_command find_command(const kvstore_argument_t *argument)
 {
-    if (argument_equals(argument, "SET")) return SERVICE_COMMAND_SET;
-    if (argument_equals(argument, "GET")) return SERVICE_COMMAND_GET;
-    if (argument_equals(argument, "DEL")) return SERVICE_COMMAND_DEL;
-    if (argument_equals(argument, "PING")) return SERVICE_COMMAND_PING;
-    if (argument_equals(argument, "EXPIRE")) return SERVICE_COMMAND_EXPIRE;
-    if (argument_equals(argument, "PEXPIRE")) return SERVICE_COMMAND_PEXPIRE;
-    if (argument_equals(argument, "TTL")) return SERVICE_COMMAND_TTL;
-    if (argument_equals(argument, "PTTL")) return SERVICE_COMMAND_PTTL;
-    if (argument_equals(argument, "PERSIST")) return SERVICE_COMMAND_PERSIST;
-    if (argument_equals(argument, "INFO")) return SERVICE_COMMAND_INFO;
-    if (argument_equals(argument, "HSET")) return SERVICE_COMMAND_HSET;
-    if (argument_equals(argument, "HGET")) return SERVICE_COMMAND_HGET;
-    if (argument_equals(argument, "HDEL")) return SERVICE_COMMAND_HDEL;
-    if (argument_equals(argument, "HLEN")) return SERVICE_COMMAND_HLEN;
-    if (argument_equals(argument, "HGETALL")) return SERVICE_COMMAND_HGETALL;
-    if (argument_equals(argument, "ZADD")) return SERVICE_COMMAND_ZADD;
-    if (argument_equals(argument, "ZREM")) return SERVICE_COMMAND_ZREM;
-    if (argument_equals(argument, "ZSCORE")) return SERVICE_COMMAND_ZSCORE;
-    if (argument_equals(argument, "ZCARD")) return SERVICE_COMMAND_ZCARD;
-    if (argument_equals(argument, "ZRANGE")) return SERVICE_COMMAND_ZRANGE;
+    switch (argument->length) {
+    case 3U:
+        if (argument_equals(argument, "SET")) return SERVICE_COMMAND_SET;
+        if (argument_equals(argument, "GET")) return SERVICE_COMMAND_GET;
+        if (argument_equals(argument, "DEL")) return SERVICE_COMMAND_DEL;
+        if (argument_equals(argument, "TTL")) return SERVICE_COMMAND_TTL;
+        break;
+    case 4U:
+        if (argument_equals(argument, "PING")) return SERVICE_COMMAND_PING;
+        if (argument_equals(argument, "PTTL")) return SERVICE_COMMAND_PTTL;
+        if (argument_equals(argument, "INFO")) return SERVICE_COMMAND_INFO;
+        if (argument_equals(argument, "HSET")) return SERVICE_COMMAND_HSET;
+        if (argument_equals(argument, "HGET")) return SERVICE_COMMAND_HGET;
+        if (argument_equals(argument, "HDEL")) return SERVICE_COMMAND_HDEL;
+        if (argument_equals(argument, "HLEN")) return SERVICE_COMMAND_HLEN;
+        if (argument_equals(argument, "ZADD")) return SERVICE_COMMAND_ZADD;
+        if (argument_equals(argument, "ZREM")) return SERVICE_COMMAND_ZREM;
+        if (argument_equals(argument, "SAVE")) return SERVICE_COMMAND_SAVE;
+        break;
+    case 5U:
+        if (argument_equals(argument, "ZCARD")) return SERVICE_COMMAND_ZCARD;
+        break;
+    case 6U:
+        if (argument_equals(argument, "EXPIRE")) return SERVICE_COMMAND_EXPIRE;
+        if (argument_equals(argument, "DBSIZE")) return SERVICE_COMMAND_DBSIZE;
+        if (argument_equals(argument, "ZSCORE")) return SERVICE_COMMAND_ZSCORE;
+        if (argument_equals(argument, "ZRANGE")) return SERVICE_COMMAND_ZRANGE;
+        if (argument_equals(argument, "BGSAVE")) return SERVICE_COMMAND_BGSAVE;
+        break;
+    case 7U:
+        if (argument_equals(argument, "PEXPIRE")) return SERVICE_COMMAND_PEXPIRE;
+        if (argument_equals(argument, "PERSIST")) return SERVICE_COMMAND_PERSIST;
+        if (argument_equals(argument, "HGETALL")) return SERVICE_COMMAND_HGETALL;
+        break;
+    case 8U:
+        if (argument_equals(argument, "LASTSAVE")) return SERVICE_COMMAND_LASTSAVE;
+        break;
+    default:
+        break;
+    }
     return SERVICE_COMMAND_UNKNOWN;
 }
 
@@ -218,6 +250,49 @@ static size_t bulk_encoded_size(size_t length)
 {
     if (length > SIZE_MAX - decimal_digits(length) - 5U) return SIZE_MAX;
     return length + decimal_digits(length) + 5U;
+}
+
+static int format_score(unsigned char *output, size_t capacity, double score)
+{
+    double scaled;
+
+    if (output == NULL || capacity == 0) return -1;
+    scaled = score * 10.0;
+    if (isfinite(score) && !(score == 0.0 && signbit(score)) &&
+        scaled >= (double)INT64_MIN && scaled <= (double)INT64_MAX) {
+        int64_t tenths = (int64_t)scaled;
+
+        if (scaled == (double)tenths && (double)tenths / 10.0 == score) {
+            unsigned char reverse[32];
+            uint64_t magnitude = tenths < 0
+                                     ? (uint64_t)(-(tenths + 1)) + 1U
+                                     : (uint64_t)tenths;
+            unsigned int fraction = (unsigned int)(magnitude % 10U);
+            uint64_t whole = magnitude / 10U;
+            size_t digits = 0;
+            size_t position = 0;
+            size_t index;
+            size_t needed;
+
+            do {
+                reverse[digits++] = (unsigned char)('0' + whole % 10U);
+                whole /= 10U;
+            } while (whole != 0);
+            needed = digits + (tenths < 0 ? 1U : 0U) +
+                     (fraction != 0 ? 2U : 0U);
+            if (needed > capacity) return -1;
+            if (tenths < 0) output[position++] = '-';
+            for (index = 0; index < digits; ++index) {
+                output[position++] = reverse[digits - index - 1U];
+            }
+            if (fraction != 0) {
+                output[position++] = '.';
+                output[position++] = (unsigned char)('0' + fraction);
+            }
+            return (int)position;
+        }
+    }
+    return snprintf((char *)output, capacity, "%.17g", score);
 }
 
 static int parse_double_argument(const kvstore_argument_t *argument,
@@ -516,6 +591,32 @@ void kvstore_service_attach_aof(kvstore_service_t *service, aof_t *aof)
     }
 }
 
+void kvstore_service_set_persistence_admin(
+    kvstore_service_t *service,
+    const kvstore_persistence_admin_t *admin,
+    void *context)
+{
+    if (service == NULL || !service->initialized) return;
+    memset(&service->persistence_admin, 0,
+           sizeof(service->persistence_admin));
+    if (admin != NULL) service->persistence_admin = *admin;
+    service->persistence_context = context;
+}
+
+uint64_t kvstore_service_dirty_changes(const kvstore_service_t *service)
+{
+    return service == NULL ? 0 : service->dirty_changes;
+}
+
+void kvstore_service_snapshot_committed(kvstore_service_t *service,
+                                        uint64_t covered_changes)
+{
+    if (service == NULL) return;
+    service->dirty_changes = covered_changes >= service->dirty_changes
+                                 ? 0
+                                 : service->dirty_changes - covered_changes;
+}
+
 static int execute_set(kvstore_service_t *service,
                        const kvstore_argument_t *arguments,
                        size_t argument_count,
@@ -659,10 +760,9 @@ static int execute_hset(kvstore_service_t *service,
                         kvstore_reply_t *reply)
 {
     size_t pair_count = (argument_count - 2U) / 2U;
-    kv_object_t *original = cache_get_object(service->cache,
-                                             arguments[1].data,
-                                             arguments[1].length,
-                                             0);
+    cache_entry_ref_t *entry_ref = NULL;
+    kv_object_t *original = cache_get_hash_object_ref(
+        service->cache, arguments[1].data, arguments[1].length, 0, &entry_ref);
     kv_object_t *working = original;
     size_t index;
     int added_total = 0;
@@ -720,9 +820,7 @@ static int execute_hset(kvstore_service_t *service,
                 return 0;
             }
         } else {
-            result = cache_recharge_object(service->cache,
-                                           arguments[1].data,
-                                           arguments[1].length);
+            result = cache_recharge_ref(service->cache, entry_ref);
             if (result != CACHE_SET_OK) {
                 set_object_error(reply, result);
                 return 0;
@@ -744,10 +842,9 @@ static int execute_hdel(kvstore_service_t *service,
                         size_t argument_count,
                         kvstore_reply_t *reply)
 {
-    kv_object_t *object = cache_get_object(service->cache,
-                                           arguments[1].data,
-                                           arguments[1].length,
-                                           0);
+    cache_entry_ref_t *entry_ref = NULL;
+    kv_object_t *object = cache_get_hash_object_ref(
+        service->cache, arguments[1].data, arguments[1].length, 0, &entry_ref);
     size_t index;
     int removed = 0;
 
@@ -778,9 +875,8 @@ static int execute_hdel(kvstore_service_t *service,
                 set_error(reply, error_internal, sizeof(error_internal) - 1U);
                 return 0;
             }
-        } else if (cache_recharge_object(service->cache,
-                                         arguments[1].data,
-                                         arguments[1].length) != CACHE_SET_OK) {
+        } else if (cache_recharge_ref(service->cache,
+                                      entry_ref) != CACHE_SET_OK) {
             set_error(reply, error_internal, sizeof(error_internal) - 1U);
             return 0;
         }
@@ -829,10 +925,8 @@ static int execute_hgetall(kvstore_service_t *service,
                            const kvstore_argument_t *arguments,
                            kvstore_reply_t *reply)
 {
-    kv_object_t *object = cache_get_object(service->cache,
-                                           arguments[1].data,
-                                           arguments[1].length,
-                                           1);
+    kv_object_t *object = cache_get_hash_object_ref(
+        service->cache, arguments[1].data, arguments[1].length, 1, NULL);
     hash_array_context_t context;
     size_t fields;
     int reserve_result;
@@ -881,7 +975,8 @@ static int execute_zadd(kvstore_service_t *service,
                         kvstore_reply_t *reply)
 {
     size_t pair_count = (argument_count - 2U) / 2U;
-    double *scores = calloc(pair_count, sizeof(*scores));
+    double *scores = service->zadd_scores;
+    cache_entry_ref_t *entry_ref = NULL;
     kv_object_t *original;
     kv_object_t *working;
     size_t index;
@@ -890,7 +985,8 @@ static int execute_zadd(kvstore_service_t *service,
     int changed_any = 0;
     int result;
 
-    if (scores == NULL) {
+    if (pair_count > sizeof(service->zadd_scores) /
+                         sizeof(service->zadd_scores[0])) {
         set_error(reply, error_internal, sizeof(error_internal) - 1U);
         return 0;
     }
@@ -898,7 +994,6 @@ static int execute_zadd(kvstore_service_t *service,
         result = parse_double_argument(&arguments[2U + index * 2U],
                                        &scores[index]);
         if (result != 0) {
-            free(scores);
             set_error(reply,
                       result == -2 ? error_internal : error_float,
                       result == -2 ? sizeof(error_internal) - 1U
@@ -906,26 +1001,24 @@ static int execute_zadd(kvstore_service_t *service,
             return 0;
         }
     }
-    original = cache_get_object(service->cache,
-                                arguments[1].data,
-                                arguments[1].length,
-                                0);
+    original = cache_get_object_ref(service->cache,
+                                    arguments[1].data,
+                                    arguments[1].length,
+                                    0,
+                                    &entry_ref);
     working = original;
     if (original != NULL && kv_object_type(original) != KV_OBJECT_ZSET) {
-        free(scores);
         set_wrongtype(reply);
         return 0;
     }
     if (original == NULL) {
         if (kv_object_create_zset(&working, service->zset_engine) != 0) {
-            free(scores);
             set_error(reply, error_internal, sizeof(error_internal) - 1U);
             return 0;
         }
         copied = 1;
     } else if (pair_count > 1U || cache_max_memory(service->cache) != 0) {
         if (kv_object_clone(original, &working) != 0) {
-            free(scores);
             set_error(reply, error_internal, sizeof(error_internal) - 1U);
             return 0;
         }
@@ -942,7 +1035,6 @@ static int execute_zadd(kvstore_service_t *service,
                                arguments[position].length,
                                &added,
                                &changed) != 0) {
-            free(scores);
             if (copied) kv_object_destroy(working);
             set_error(reply, error_internal, sizeof(error_internal) - 1U);
             return 0;
@@ -950,7 +1042,6 @@ static int execute_zadd(kvstore_service_t *service,
         added_total += added;
         changed_any |= changed;
     }
-    free(scores);
     if (changed_any) {
         if (copied) {
             result = cache_store_object(service->cache,
@@ -965,9 +1056,7 @@ static int execute_zadd(kvstore_service_t *service,
                 return 0;
             }
         } else {
-            result = cache_recharge_object(service->cache,
-                                           arguments[1].data,
-                                           arguments[1].length);
+            result = cache_recharge_ref(service->cache, entry_ref);
             if (result != CACHE_SET_OK) {
                 set_object_error(reply, result);
                 return 0;
@@ -989,10 +1078,12 @@ static int execute_zrem(kvstore_service_t *service,
                         size_t argument_count,
                         kvstore_reply_t *reply)
 {
-    kv_object_t *object = cache_get_object(service->cache,
-                                           arguments[1].data,
-                                           arguments[1].length,
-                                           0);
+    cache_entry_ref_t *entry_ref = NULL;
+    kv_object_t *object = cache_get_object_ref(service->cache,
+                                               arguments[1].data,
+                                               arguments[1].length,
+                                               0,
+                                               &entry_ref);
     size_t index;
     int removed = 0;
 
@@ -1023,9 +1114,8 @@ static int execute_zrem(kvstore_service_t *service,
                 set_error(reply, error_internal, sizeof(error_internal) - 1U);
                 return 0;
             }
-        } else if (cache_recharge_object(service->cache,
-                                         arguments[1].data,
-                                         arguments[1].length) != CACHE_SET_OK) {
+        } else if (cache_recharge_ref(service->cache,
+                                      entry_ref) != CACHE_SET_OK) {
             set_error(reply, error_internal, sizeof(error_internal) - 1U);
             return 0;
         }
@@ -1084,7 +1174,7 @@ static int collect_zset_member(const void *member,
     if (collection->with_scores) {
         unsigned char *destination = collection->service->reply_score_buffer +
                                      collection->score_index * 32U;
-        int written = snprintf((char *)destination, 32U, "%.17g", score);
+        int written = format_score(destination, 32U, score);
         size_t score_size;
 
         if (written < 0 || written >= 32) return -1;
@@ -1270,6 +1360,11 @@ static int command_arity_valid(enum service_command command,
         return argument_count == 3U;
     case SERVICE_COMMAND_PING:
         return argument_count == 1U || argument_count == 2U;
+    case SERVICE_COMMAND_DBSIZE:
+    case SERVICE_COMMAND_SAVE:
+    case SERVICE_COMMAND_BGSAVE:
+    case SERVICE_COMMAND_LASTSAVE:
+        return argument_count == 1U;
     case SERVICE_COMMAND_INFO:
         return argument_count == 2U;
     case SERVICE_COMMAND_HSET:
@@ -1285,19 +1380,53 @@ static int command_arity_valid(enum service_command command,
     }
 }
 
-int kvstore_service_execute(kvstore_service_t *service,
-                            const kvstore_argument_t *arguments,
-                            size_t argument_count,
-                            kvstore_reply_t *reply)
-{
-    enum service_command command;
+static int execute_persistence_info(kvstore_service_t *service,
+                                    kvstore_reply_t *reply);
 
+static int execute_save_command(kvstore_service_t *service,
+                                int background,
+                                kvstore_reply_t *reply)
+{
+    int result;
+
+    if (service->persistence_admin.save == NULL) {
+        set_error(reply, error_rdb_disabled,
+                  sizeof(error_rdb_disabled) - 1U);
+        return 0;
+    }
+    result = service->persistence_admin.save(service->persistence_context,
+                                             background);
+    if (result != 0) {
+        if (errno == EBUSY) {
+            set_error(reply, error_save_busy, sizeof(error_save_busy) - 1U);
+        } else if (errno == ENOTSUP) {
+            set_error(reply, error_rdb_disabled,
+                      sizeof(error_rdb_disabled) - 1U);
+        } else {
+            set_error(reply, error_internal, sizeof(error_internal) - 1U);
+        }
+    } else if (background) {
+        set_data_reply(reply, KVSTORE_REPLY_SIMPLE,
+                       reply_bgsave_started,
+                       sizeof(reply_bgsave_started) - 1U);
+    } else {
+        set_data_reply(reply, KVSTORE_REPLY_SIMPLE,
+                       reply_ok, sizeof(reply_ok) - 1U);
+    }
+    return 0;
+}
+
+static int execute_command(kvstore_service_t *service,
+                           enum service_command command,
+                           const kvstore_argument_t *arguments,
+                           size_t argument_count,
+                           kvstore_reply_t *reply)
+{
     if (service == NULL || !service->initialized || arguments == NULL ||
         argument_count == 0 || reply == NULL) {
         return -1;
     }
     memset(reply, 0, sizeof(*reply));
-    command = find_command(&arguments[0]);
     if (command == SERVICE_COMMAND_UNKNOWN) {
         set_error(reply, error_unknown, sizeof(error_unknown) - 1U);
         return 0;
@@ -1403,19 +1532,39 @@ int kvstore_service_execute(kvstore_service_t *service,
         }
         return 0;
     case SERVICE_COMMAND_INFO:
+        if (argument_equals(&arguments[1], "PERSISTENCE")) {
+            return execute_persistence_info(service, reply);
+        }
         if (!argument_equals(&arguments[1], "CACHE")) {
             set_error(reply, error_syntax, sizeof(error_syntax) - 1U);
             return 0;
         }
         return execute_info(service, reply);
+    case SERVICE_COMMAND_DBSIZE:
+        {
+            cache_stats_t stats;
+
+            cache_get_stats(service->cache, &stats);
+            set_integer(reply, (int64_t)stats.keys);
+        }
+        return 0;
+    case SERVICE_COMMAND_SAVE:
+        return execute_save_command(service, 0, reply);
+    case SERVICE_COMMAND_BGSAVE:
+        return execute_save_command(service, 1, reply);
+    case SERVICE_COMMAND_LASTSAVE:
+        set_integer(reply,
+                    service->persistence_admin.lastsave == NULL
+                        ? 0
+                        : (int64_t)service->persistence_admin.lastsave(
+                              service->persistence_context));
+        return 0;
     case SERVICE_COMMAND_HSET:
         return execute_hset(service, arguments, argument_count, reply);
     case SERVICE_COMMAND_HGET:
         {
-            kv_object_t *object = cache_get_object(service->cache,
-                                                   arguments[1].data,
-                                                   arguments[1].length,
-                                                   1);
+            kv_object_t *object = cache_get_hash_object_ref(
+                service->cache, arguments[1].data, arguments[1].length, 1, NULL);
 
             if (object == NULL) {
                 reply->type = KVSTORE_REPLY_NULL_BULK;
@@ -1435,10 +1584,8 @@ int kvstore_service_execute(kvstore_service_t *service,
         return execute_hdel(service, arguments, argument_count, reply);
     case SERVICE_COMMAND_HLEN:
         {
-            kv_object_t *object = cache_get_object(service->cache,
-                                                   arguments[1].data,
-                                                   arguments[1].length,
-                                                   1);
+            kv_object_t *object = cache_get_hash_object_ref(
+                service->cache, arguments[1].data, arguments[1].length, 1, NULL);
 
             if (object == NULL) set_integer(reply, 0);
             else if (kv_object_type(object) != KV_OBJECT_HASH) set_wrongtype(reply);
@@ -1483,10 +1630,9 @@ int kvstore_service_execute(kvstore_service_t *service,
                     set_error(reply, error_internal, sizeof(error_internal) - 1U);
                     return 0;
                 }
-                written = snprintf((char *)service->reply_score_buffer,
-                                   32U,
-                                   "%.17g",
-                                   score);
+                written = format_score(service->reply_score_buffer,
+                                       32U,
+                                       score);
                 if (written < 0 || written >= 32) {
                     set_error(reply, error_internal, sizeof(error_internal) - 1U);
                 } else {
@@ -1520,6 +1666,138 @@ int kvstore_service_execute(kvstore_service_t *service,
     }
 }
 
+int kvstore_service_execute_with_barrier(kvstore_service_t *service,
+                                         const kvstore_argument_t *arguments,
+                                         size_t argument_count,
+                                         kvstore_reply_t *reply,
+                                         uint64_t *response_barrier)
+{
+    enum service_command command;
+    int logical_write;
+    int write_command;
+    int result;
+
+    if (response_barrier != NULL) *response_barrier = 0;
+    if (service == NULL || arguments == NULL || argument_count == 0 ||
+        reply == NULL) return -1;
+    command = find_command(&arguments[0]);
+    logical_write = command != SERVICE_COMMAND_UNKNOWN &&
+                    command_arity_valid(command, argument_count) &&
+                    is_write_command(command);
+    write_command = logical_write && service->aof != NULL;
+    if (write_command && aof_transaction_begin(service->aof) != 0) {
+        static const unsigned char busy[] =
+            "TRYAGAIN AOF writer queue is above the high-water mark";
+
+        memset(reply, 0, sizeof(*reply));
+        set_error(reply, busy, sizeof(busy) - 1U);
+        return 0;
+    }
+    result = execute_command(service, command, arguments, argument_count, reply);
+    if (result == 0 && logical_write && reply->type != KVSTORE_REPLY_ERROR) {
+        service->dirty_changes++;
+    }
+    if (!write_command) return result;
+    if (result != 0) {
+        aof_transaction_rollback(service->aof);
+        return result;
+    }
+    if (aof_transaction_commit(service->aof, response_barrier) != 0) {
+        aof_transaction_rollback(service->aof);
+        set_aof_error(reply);
+    }
+    return 0;
+}
+
+static int execute_persistence_info(kvstore_service_t *service,
+                                    kvstore_reply_t *reply)
+{
+    aof_info_t info;
+    kvstore_persistence_info_t persistence;
+    int written;
+
+    aof_get_info(service->aof, &info);
+    memset(&persistence, 0, sizeof(persistence));
+    persistence.dirty_changes = service->dirty_changes;
+    if (service->persistence_admin.get_info != NULL) {
+        service->persistence_admin.get_info(service->persistence_context,
+                                            &persistence);
+    }
+    written = snprintf((char *)service->info_buffer,
+                       sizeof(service->info_buffer),
+                       "aof_enabled:%d\r\n"
+                       "aof_queue_bytes:%zu\r\n"
+                       "aof_queue_high_water:%zu\r\n"
+                       "aof_queue_low_water:%zu\r\n"
+                       "aof_enqueued_sequence:%" PRIu64 "\r\n"
+                       "aof_written_sequence:%" PRIu64 "\r\n"
+                       "aof_synced_sequence:%" PRIu64 "\r\n"
+                       "aof_written_bytes:%" PRIu64 "\r\n"
+                       "aof_backpressure_events:%" PRIu64 "\r\n"
+                       "aof_fsync_count:%" PRIu64 "\r\n"
+                       "aof_fsync_total_us:%" PRIu64 "\r\n"
+                       "aof_fsync_max_us:%" PRIu64 "\r\n"
+                       "aof_backpressured:%d\r\n"
+                       "aof_failed:%d\r\n"
+                       "aof_last_error:%d\r\n"
+                       "rdb_enabled:%d\r\n"
+                       "rdb_bgsave_in_progress:%d\r\n"
+                       "rdb_dirty_changes:%" PRIu64 "\r\n"
+                       "rdb_last_save_time:%" PRIu64 "\r\n"
+                        "rdb_last_save_duration_us:%" PRIu64 "\r\n"
+                        "rdb_last_fork_pause_us:%" PRIu64 "\r\n"
+                        "rdb_last_child_peak_rss_kb:%" PRIu64 "\r\n"
+                        "rdb_last_child_minor_faults:%" PRIu64 "\r\n"
+                        "rdb_last_child_major_faults:%" PRIu64 "\r\n"
+                        "rdb_last_save_status:%d\r\n"
+                       "rdb_checkpoint_offset:%" PRIu64 "\r\n",
+                       service->aof != NULL,
+                       info.queue_bytes,
+                       info.queue_high_water,
+                       info.queue_low_water,
+                       info.enqueued_sequence,
+                       info.written_sequence,
+                       info.synced_sequence,
+                       info.written_bytes,
+                       info.backpressure_events,
+                       info.fsync_count,
+                       info.fsync_total_us,
+                       info.fsync_max_us,
+                       info.backpressured,
+                       info.failed,
+                       info.last_error,
+                       persistence.rdb_enabled,
+                       persistence.bgsave_in_progress,
+                       persistence.dirty_changes,
+                       persistence.last_save_time,
+                        persistence.last_save_duration_us,
+                        persistence.last_fork_pause_us,
+                        persistence.last_child_peak_rss_kb,
+                        persistence.last_child_minor_faults,
+                        persistence.last_child_major_faults,
+                        persistence.last_save_status,
+                       persistence.checkpoint_offset);
+    if (written < 0 || (size_t)written >= sizeof(service->info_buffer)) {
+        set_error(reply, error_internal, sizeof(error_internal) - 1U);
+    } else {
+        set_data_reply(reply, KVSTORE_REPLY_BULK, service->info_buffer,
+                       (size_t)written);
+    }
+    return 0;
+}
+
+int kvstore_service_execute(kvstore_service_t *service,
+                            const kvstore_argument_t *arguments,
+                            size_t argument_count,
+                            kvstore_reply_t *reply)
+{
+    return kvstore_service_execute_with_barrier(service,
+                                                arguments,
+                                                argument_count,
+                                                reply,
+                                                NULL);
+}
+
 static int replay_argument_equals(const aof_argument_t *argument,
                                   const char *name)
 {
@@ -1527,7 +1805,7 @@ static int replay_argument_equals(const aof_argument_t *argument,
 
     service_argument.data = argument->data;
     service_argument.length = argument->length;
-    return argument_equals(&service_argument, name);
+    return argument_equals_length(&service_argument, name, strlen(name));
 }
 
 int kvstore_service_replay_aof(const aof_argument_t *arguments,
@@ -1541,6 +1819,10 @@ int kvstore_service_replay_aof(const aof_argument_t *arguments,
     if (service == NULL || !service->initialized || arguments == NULL ||
         argument_count == 0) {
         return -1;
+    }
+    if (replay_argument_equals(&arguments[0], "PING") &&
+        (argument_count == 1U || argument_count == 2U)) {
+        return 0;
     }
     now = cache_current_time_ms(service->cache);
     if (replay_argument_equals(&arguments[0], "SET")) {

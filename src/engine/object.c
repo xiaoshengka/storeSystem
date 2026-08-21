@@ -11,8 +11,9 @@
 #define ZSKIPLIST_THRESHOLD ((UINT64_MAX / 4U))
 
 typedef struct hash_value {
-    unsigned char *data;
     size_t length;
+    size_t capacity;
+    unsigned char data[];
 } hash_value_t;
 
 typedef struct zmember zmember_t;
@@ -84,12 +85,14 @@ struct kv_object {
         struct {
             unsigned char *data;
             size_t length;
+            size_t capacity;
         } string;
         struct {
             hashtable_t *table;
         } hash;
         zset_t *zset;
     } value;
+    unsigned char inline_data[];
 };
 
 static int valid_bytes(const void *data, size_t length)
@@ -97,22 +100,21 @@ static int valid_bytes(const void *data, size_t length)
     return data != NULL || length == 0;
 }
 
-static unsigned char *copy_bytes(const void *data, size_t length)
+static hash_value_t *hash_value_create(const void *data, size_t length)
 {
-    unsigned char *copy;
+    hash_value_t *value;
 
-    if (!valid_bytes(data, length) || length == SIZE_MAX) {
+    if (!valid_bytes(data, length) || length == SIZE_MAX ||
+        sizeof(*value) > SIZE_MAX - length - 1U) {
         return NULL;
     }
-    copy = malloc(length + 1U);
-    if (copy == NULL) {
-        return NULL;
-    }
-    if (length > 0) {
-        memcpy(copy, data, length);
-    }
-    copy[length] = '\0';
-    return copy;
+    value = malloc(sizeof(*value) + length + 1U);
+    if (value == NULL) return NULL;
+    value->length = length;
+    value->capacity = length;
+    if (length > 0) memcpy(value->data, data, length);
+    value->data[length] = '\0';
+    return value;
 }
 
 static int compare_bytes(const void *left,
@@ -259,7 +261,7 @@ static skip_node_t *skiplist_prepare_node(skiplist_t *list, double score)
     return skip_node_create(skip_random_level(list), score);
 }
 
-static void skiplist_remove_node(skiplist_t *list, skip_node_t *target)
+static void skiplist_detach_node(skiplist_t *list, skip_node_t *target)
 {
     skip_node_t *update[ZSKIPLIST_MAXLEVEL];
     skip_node_t *current = list->header;
@@ -295,7 +297,6 @@ static void skiplist_remove_node(skiplist_t *list, skip_node_t *target)
         list->level--;
     }
     list->length--;
-    free(target);
 }
 
 static skip_node_t *skiplist_by_rank(skiplist_t *list, size_t rank)
@@ -555,7 +556,7 @@ static void rbtree_delete_fixup(rb_tree_t *tree, rb_node_t *node)
     node->color = RB_BLACK;
 }
 
-static void rbtree_remove_node(rb_tree_t *tree, rb_node_t *target)
+static void rbtree_detach_node(rb_tree_t *tree, rb_node_t *target)
 {
     rb_node_t *moved = target;
     rb_node_t *fixup;
@@ -599,7 +600,6 @@ static void rbtree_remove_node(rb_tree_t *tree, rb_node_t *target)
     if (original == RB_BLACK) rbtree_delete_fixup(tree, fixup);
     rb_recalculate_up(tree, fixup->parent);
     tree->length--;
-    free(target);
 }
 
 static rb_node_t *rbtree_by_rank(rb_tree_t *tree, size_t rank)
@@ -685,13 +685,35 @@ static void ordered_insert_node(zset_t *set, void *node)
     }
 }
 
-static void ordered_remove_node(zset_t *set, void *node)
+static void ordered_set_score(zset_t *set, void *node, double score)
 {
     if (set->engine == KV_ZSET_SKIPLIST) {
-        skiplist_remove_node(&set->order.skiplist, node);
+        ((skip_node_t *)node)->score = score;
     } else {
-        rbtree_remove_node(&set->order.rbtree, node);
+        rb_node_t *rb_node = node;
+
+        rb_node->left = set->order.rbtree.nil;
+        rb_node->right = set->order.rbtree.nil;
+        rb_node->parent = set->order.rbtree.nil;
+        rb_node->color = RB_RED;
+        rb_node->score = score;
+        rb_node->subtree_size = 1U;
     }
+}
+
+static void ordered_detach_node(zset_t *set, void *node)
+{
+    if (set->engine == KV_ZSET_SKIPLIST) {
+        skiplist_detach_node(&set->order.skiplist, node);
+    } else {
+        rbtree_detach_node(&set->order.rbtree, node);
+    }
+}
+
+static void ordered_remove_node(zset_t *set, void *node)
+{
+    ordered_detach_node(set, node);
+    free(node);
 }
 
 static void ordered_free_prepared(void *node)
@@ -701,12 +723,7 @@ static void ordered_free_prepared(void *node)
 
 static void hash_value_destroy(void *payload)
 {
-    hash_value_t *value = payload;
-
-    if (value != NULL) {
-        free(value->data);
-        free(value);
-    }
+    free(payload);
 }
 
 static void zmember_destroy(void *payload)
@@ -722,15 +739,16 @@ int kv_object_create_string(kv_object_t **out_object,
 
     if (out_object == NULL || !valid_bytes(value, value_length)) return -1;
     *out_object = NULL;
-    object = calloc(1, sizeof(*object));
+    if (value_length == SIZE_MAX ||
+        sizeof(*object) > SIZE_MAX - value_length - 1U) return -1;
+    object = calloc(1, sizeof(*object) + value_length + 1U);
     if (object == NULL) return -1;
-    object->value.string.data = copy_bytes(value, value_length);
-    if (object->value.string.data == NULL) {
-        free(object);
-        return -1;
-    }
+    object->value.string.data = object->inline_data;
+    if (value_length > 0) memcpy(object->inline_data, value, value_length);
+    object->inline_data[value_length] = '\0';
     object->type = KV_OBJECT_STRING;
     object->value.string.length = value_length;
+    object->value.string.capacity = value_length;
     object->memory_usage = sizeof(*object) + value_length + 1U;
     *out_object = object;
     return 0;
@@ -790,9 +808,7 @@ int kv_object_create_zset(kv_object_t **out_object, kv_zset_engine_t engine)
 void kv_object_destroy(kv_object_t *object)
 {
     if (object == NULL) return;
-    if (object->type == KV_OBJECT_STRING) {
-        free(object->value.string.data);
-    } else if (object->type == KV_OBJECT_HASH) {
+    if (object->type == KV_OBJECT_HASH) {
         kv_hash_release(object->value.hash.table, hash_value_destroy);
     } else if (object->type == KV_OBJECT_ZSET) {
         zset_t *set = object->value.zset;
@@ -825,6 +841,19 @@ const void *kv_object_string_value(const kv_object_t *object,
     return object->value.string.data;
 }
 
+int kv_object_string_update(kv_object_t *object,
+                            const void *value,
+                            size_t value_length)
+{
+    if (object == NULL || object->type != KV_OBJECT_STRING ||
+        !valid_bytes(value, value_length)) return -1;
+    if (value_length > object->value.string.capacity) return 0;
+    if (value_length > 0) memcpy(object->value.string.data, value, value_length);
+    object->value.string.data[value_length] = '\0';
+    object->value.string.length = value_length;
+    return 1;
+}
+
 int kv_object_hash_set(kv_object_t *object,
                        const void *field,
                        size_t field_length,
@@ -851,29 +880,24 @@ int kv_object_hash_set(kv_object_t *object,
             (value_length == 0 || memcmp(old->data, value, value_length) == 0)) {
             return 0;
         }
-        replacement = calloc(1, sizeof(*replacement));
-        if (replacement == NULL) return -1;
-        replacement->data = copy_bytes(value, value_length);
-        if (replacement->data == NULL) {
-            free(replacement);
-            return -1;
+        if (value_length <= old->capacity) {
+            if (value_length > 0) memcpy(old->data, value, value_length);
+            old->data[value_length] = '\0';
+            old->length = value_length;
+            if (changed != NULL) *changed = 1;
+            return 0;
         }
-        replacement->length = value_length;
-        object->memory_usage = object->memory_usage - old->length - 1U +
-                               value_length + 1U;
+        replacement = hash_value_create(value, value_length);
+        if (replacement == NULL) return -1;
+        object->memory_usage = object->memory_usage - old->capacity - 1U +
+                               replacement->capacity + 1U;
         kv_hash_node_set_payload(node, replacement);
         hash_value_destroy(old);
         if (changed != NULL) *changed = 1;
         return 0;
     }
-    replacement = calloc(1, sizeof(*replacement));
+    replacement = hash_value_create(value, value_length);
     if (replacement == NULL) return -1;
-    replacement->data = copy_bytes(value, value_length);
-    if (replacement->data == NULL) {
-        free(replacement);
-        return -1;
-    }
-    replacement->length = value_length;
     {
         size_t old_index = kv_hash_index_memory(object->value.hash.table);
 
@@ -888,7 +912,8 @@ int kv_object_hash_set(kv_object_t *object,
         object->memory_usage += kv_hash_index_memory(object->value.hash.table) -
                                 old_index +
                                 kv_hash_node_memory_for_key(field_length) +
-                                sizeof(*replacement) + value_length + 1U;
+                                sizeof(*replacement) +
+                                replacement->capacity + 1U;
     }
     if (added != NULL) *added = 1;
     if (changed != NULL) *changed = 1;
@@ -928,7 +953,7 @@ int kv_object_hash_delete(kv_object_t *object,
     if (node == NULL) return 0;
     value = kv_hash_node_payload(node);
     charge = kv_hash_node_memory_for_key(field_length) + sizeof(*value) +
-             value->length + 1U;
+             value->capacity + 1U;
     value = kv_hash_remove_node(object->value.hash.table, node);
     hash_value_destroy(value);
     object->memory_usage -= charge;
@@ -987,18 +1012,10 @@ int kv_object_zset_add(kv_object_t *object,
     if (dict_node != NULL) {
         entry = kv_hash_node_payload(dict_node);
         if (entry->score == score) return 0;
-        prepared = ordered_prepare_node(set, score);
-        if (prepared == NULL) return -1;
-        ordered_set_member(set,
-                           prepared,
-                           kv_hash_node_key(dict_node),
-                           kv_hash_node_key_length(dict_node));
-        object->memory_usage -= ordered_node_memory(set, entry->order_node);
-        ordered_remove_node(set, entry->order_node);
+        ordered_detach_node(set, entry->order_node);
         entry->score = score;
-        entry->order_node = prepared;
-        ordered_insert_node(set, prepared);
-        object->memory_usage += ordered_node_memory(set, prepared);
+        ordered_set_score(set, entry->order_node, score);
+        ordered_insert_node(set, entry->order_node);
         if (changed != NULL) *changed = 1;
         return 0;
     }

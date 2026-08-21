@@ -2,6 +2,9 @@
 #define STORE_SYSTEM_PERSISTENCE_AOF_H
 
 #include <stddef.h>
+#include <stdint.h>
+
+#include "persistence/rdb.h"
 
 typedef struct aof aof_t;
 
@@ -25,6 +28,23 @@ typedef struct aof_replay_stats {
     int truncated_tail_repaired;
 } aof_replay_stats_t;
 
+typedef struct aof_info {
+    size_t queue_bytes;
+    size_t queue_high_water;
+    size_t queue_low_water;
+    uint64_t enqueued_sequence;
+    uint64_t written_sequence;
+    uint64_t synced_sequence;
+    uint64_t written_bytes;
+    uint64_t backpressure_events;
+    uint64_t fsync_count;
+    uint64_t fsync_total_us;
+    uint64_t fsync_max_us;
+    int backpressured;
+    int failed;
+    int last_error;
+} aof_info_t;
+
 int aof_open(aof_t **out_aof,
              const char *path,
              aof_fsync_policy_t fsync_policy);
@@ -32,13 +52,31 @@ int aof_replay(aof_t *aof,
                aof_replay_callback callback,
                void *context,
                aof_replay_stats_t *stats);
+int aof_replay_from(aof_t *aof,
+                    uint64_t offset,
+                    aof_replay_callback callback,
+                    void *context,
+                    aof_replay_stats_t *stats);
+int aof_create_checkpoint(aof_t *aof, rdb_checkpoint_t *checkpoint);
+int aof_validate_checkpoint(aof_t *aof,
+                            const rdb_checkpoint_t *checkpoint);
+int aof_pause_for_fork(aof_t *aof);
+void aof_resume_after_fork(aof_t *aof);
 int aof_append(aof_t *aof,
                const aof_argument_t *arguments,
                size_t argument_count);
+int aof_transaction_begin(aof_t *aof);
+int aof_transaction_commit(aof_t *aof, uint64_t *sequence);
+void aof_transaction_rollback(aof_t *aof);
+int aof_can_accept_write(aof_t *aof);
 int aof_flush(aof_t *aof);
 int aof_maintain(aof_t *aof);
 int aof_is_failed(aof_t *aof);
 int aof_last_error(aof_t *aof);
+int aof_set_notify_fd(aof_t *aof, int notify_fd);
+int aof_sequence_ready(aof_t *aof, uint64_t sequence);
+void aof_get_info(aof_t *aof, aof_info_t *info);
 int aof_close(aof_t *aof);
+void aof_close_in_child(aof_t *aof);
 
 #endif

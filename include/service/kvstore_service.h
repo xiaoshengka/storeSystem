@@ -7,6 +7,26 @@
 #include "cache/cache.h"
 #include "persistence/aof.h"
 
+typedef struct kvstore_persistence_info {
+    int rdb_enabled;
+    int bgsave_in_progress;
+    uint64_t dirty_changes;
+    uint64_t last_save_time;
+    uint64_t last_save_duration_us;
+    uint64_t last_fork_pause_us;
+    uint64_t last_child_peak_rss_kb;
+    uint64_t last_child_minor_faults;
+    uint64_t last_child_major_faults;
+    uint64_t checkpoint_offset;
+    int last_save_status;
+} kvstore_persistence_info_t;
+
+typedef struct kvstore_persistence_admin {
+    int (*save)(void *context, int background);
+    uint64_t (*lastsave)(void *context);
+    void (*get_info)(void *context, kvstore_persistence_info_t *info);
+} kvstore_persistence_admin_t;
+
 typedef struct kvstore_service {
     cache_t *cache;
     aof_t *aof;
@@ -18,6 +38,10 @@ typedef struct kvstore_service {
     size_t reply_element_capacity;
     unsigned char *reply_score_buffer;
     size_t reply_score_capacity;
+    double zadd_scores[64];
+    kvstore_persistence_admin_t persistence_admin;
+    void *persistence_context;
+    uint64_t dirty_changes;
 } kvstore_service_t;
 
 typedef struct kvstore_argument {
@@ -56,6 +80,13 @@ void kvstore_service_destroy(kvstore_service_t *service);
 int kvstore_service_maintain(kvstore_service_t *service);
 int kvstore_service_flush(kvstore_service_t *service);
 void kvstore_service_attach_aof(kvstore_service_t *service, aof_t *aof);
+void kvstore_service_set_persistence_admin(
+    kvstore_service_t *service,
+    const kvstore_persistence_admin_t *admin,
+    void *context);
+uint64_t kvstore_service_dirty_changes(const kvstore_service_t *service);
+void kvstore_service_snapshot_committed(kvstore_service_t *service,
+                                        uint64_t covered_changes);
 int kvstore_service_replay_aof(const aof_argument_t *arguments,
                                size_t argument_count,
                                void *context);
@@ -63,6 +94,11 @@ int kvstore_service_execute(kvstore_service_t *service,
                             const kvstore_argument_t *arguments,
                             size_t argument_count,
                             kvstore_reply_t *reply);
+int kvstore_service_execute_with_barrier(kvstore_service_t *service,
+                                         const kvstore_argument_t *arguments,
+                                         size_t argument_count,
+                                         kvstore_reply_t *reply,
+                                         uint64_t *response_barrier);
 
 int kvstore_engine_init(void);
 void kvstore_engine_destroy(void);
