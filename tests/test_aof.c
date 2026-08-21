@@ -47,6 +47,16 @@ static int capture_command(const aof_argument_t *arguments,
     return 0;
 }
 
+static int reject_command(const aof_argument_t *arguments,
+                          size_t argument_count,
+                          void *context)
+{
+    (void)arguments;
+    (void)argument_count;
+    (void)context;
+    return -1;
+}
+
 static void write_complete(int fd, const void *data, size_t length)
 {
     const unsigned char *bytes = data;
@@ -132,6 +142,31 @@ int main(void)
     fd = open(path, O_WRONLY | O_TRUNC);
     assert(fd >= 0);
     assert(close(fd) == 0);
+    assert(aof_open(&aof, path, AOF_FSYNC_EVERYSEC) == 0);
+    {
+        struct timespec delay = {0, 1000000L};
+        aof_info_t info;
+        int attempts;
+
+        for (attempts = 0; attempts < 1200; ++attempts) {
+            uint64_t sequence = 0;
+
+            assert(aof_transaction_begin(aof) == 0);
+            assert(aof_append(aof, set_arguments, 3U) == 0);
+            assert(aof_transaction_commit(aof, &sequence) == 0);
+            assert(sequence > 0);
+            assert(aof_flush(aof) == 0);
+            assert(nanosleep(&delay, NULL) == 0);
+        }
+        aof_get_info(aof, &info);
+        assert(info.fsync_count >= 1U);
+        assert(info.synced_sequence > 0U);
+    }
+    assert(aof_close(aof) == 0);
+
+    fd = open(path, O_WRONLY | O_TRUNC);
+    assert(fd >= 0);
+    assert(close(fd) == 0);
     assert(aof_open(&aof, path, AOF_FSYNC_NO) == 0);
     {
         uint64_t sequence = 0;
@@ -164,6 +199,24 @@ int main(void)
     assert(aof_replay(aof, capture_command, &capture, &stats) == 0);
     assert(capture.count == 2U);
     assert(stats.commands_loaded == 2U);
+    assert(aof_close(aof) == 0);
+
+    fd = open(path, O_WRONLY | O_TRUNC);
+    assert(fd >= 0);
+    assert(close(fd) == 0);
+    assert(aof_open(&aof, path, AOF_FSYNC_NO) == 0);
+    {
+        rdb_checkpoint_t checkpoint;
+
+        assert(aof_create_checkpoint(aof, &checkpoint) == 0);
+        assert(checkpoint.valid && checkpoint.aof_offset > 0);
+        assert(aof_validate_checkpoint(aof, &checkpoint) == 0);
+        assert(aof_replay_from(aof, checkpoint.aof_offset,
+                               reject_command, NULL, &stats) == 0);
+        assert(stats.commands_loaded == 0U);
+        assert(aof_pause_for_fork(aof) == 0);
+        aof_resume_after_fork(aof);
+    }
     assert(aof_close(aof) == 0);
 
     assert(unlink(path) == 0);

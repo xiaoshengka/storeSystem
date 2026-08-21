@@ -43,13 +43,29 @@ static int valid_bytes(const void *data, size_t length)
 static uint64_t hash_bytes(const void *key, size_t key_length)
 {
     const unsigned char *cursor = key;
-    size_t index;
-    uint64_t value = UINT64_C(14695981039346656037);
+    size_t index = 0;
+    const uint64_t prime = UINT64_C(1099511628211);
+    uint64_t lane0 = UINT64_C(14695981039346656037);
+    uint64_t lane1 = lane0 ^ UINT64_C(0x9e3779b185ebca87);
+    uint64_t lane2 = lane0 ^ UINT64_C(0xc2b2ae3d27d4eb4f);
+    uint64_t lane3 = lane0 ^ UINT64_C(0x165667b19e3779f9);
+    uint64_t value;
 
-    for (index = 0; index < key_length; ++index) {
-        value ^= cursor[index];
-        value *= UINT64_C(1099511628211);
+    /* Four independent FNV lanes preserve byte-sensitive mixing while
+     * breaking the serial multiply chain for common 64-byte members. */
+    for (; index + 4U <= key_length; index += 4U) {
+        lane0 = (lane0 ^ cursor[index]) * prime;
+        lane1 = (lane1 ^ cursor[index + 1U]) * prime;
+        lane2 = (lane2 ^ cursor[index + 2U]) * prime;
+        lane3 = (lane3 ^ cursor[index + 3U]) * prime;
     }
+    for (; index < key_length; ++index) {
+        lane0 = (lane0 ^ cursor[index]) * prime;
+    }
+    value = lane0 ^ ((lane1 << 13U) | (lane1 >> 51U)) ^
+            ((lane2 << 29U) | (lane2 >> 35U)) ^
+            ((lane3 << 47U) | (lane3 >> 17U)) ^
+            ((uint64_t)key_length * UINT64_C(0x9e3779b185ebca87));
     value ^= value >> 33U;
     value *= UINT64_C(0xff51afd7ed558ccd);
     value ^= value >> 33U;

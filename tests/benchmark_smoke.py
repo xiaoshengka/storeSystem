@@ -46,6 +46,15 @@ def load_collection_compare_module():
     return module
 
 
+def load_release_gate_module():
+    path = Path("bench/v062_release_gate.py")
+    spec = spec_from_file_location("v062_release_gate", path)
+    assert spec is not None and spec.loader is not None
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_collection_compare_matrix() -> None:
     module = load_collection_compare_module()
     cases = module.build_cases(
@@ -81,6 +90,34 @@ def test_collection_compare_matrix() -> None:
     )
     rewrite_option = redis_command.index("--auto-aof-rewrite-percentage")
     assert redis_command[rewrite_option + 1] == "0"
+
+    release_cases = module.build_cases(
+        ("skiplist", "rbtree", "redis"),
+        ("off", "everysec"),
+        ("string-mixed", "hash-mixed", "zset-mixed"),
+        5,
+        (16, 64),
+        ("normal", "bgsave"),
+    )
+    assert len(release_cases) == 210
+    assert all(case[2] == "everysec" for case in release_cases
+               if case[6] == "bgsave")
+
+
+def test_release_gate_selection() -> None:
+    module = load_release_gate_module()
+    rows = []
+    for target, qps in (("skiplist", 100.0), ("rbtree", 100.5)):
+        for policy in ("off", "everysec"):
+            for pipeline in (16, 64):
+                rows.append({
+                    "target": target, "policy": policy,
+                    "scenario": "normal", "workload": "zset-mixed",
+                    "pipeline": str(pipeline), "rounds": "5",
+                    "cv_valid": "1", "qps_median": str(qps),
+                })
+    winner, _, relative = module.select_zset(rows, 5)
+    assert relative <= 0.01 and winner == "skiplist"
 
 
 def test_string_mixed_compare_script() -> None:
@@ -305,6 +342,7 @@ def test_latency_benchmark_script() -> None:
 
 def main() -> int:
     test_collection_compare_matrix()
+    test_release_gate_selection()
     test_string_mixed_compare_script()
     test_latency_metrics()
     test_collection_metrics()

@@ -51,12 +51,21 @@ static void test_buffer_operations(void)
 
     assert(net_buffer_init(&buffer, 8) == 0);
     assert(net_buffer_append(&buffer, first, sizeof(first) - 1U) == 0);
-    assert(net_buffer_readable(&buffer) == 6U);
+    {
+        size_t writable = 0;
+        char *window = net_buffer_write_pointer(&buffer, 3U, &writable);
+
+        assert(window != NULL && writable >= 3U);
+        memcpy(window, "XYZ", 3U);
+        assert(net_buffer_commit(&buffer, 3U) == 0);
+    }
+    assert(net_buffer_readable(&buffer) == 9U);
     net_buffer_consume(&buffer, 4U);
     assert(net_buffer_append(&buffer, second, sizeof(second) - 1U) == 0);
-    assert(net_buffer_readable(&buffer) == 22U);
-    assert(memcmp(buffer.data + buffer.read_pos, "efghijklmnopqrstuvwxyz", 22U) == 0);
-    net_buffer_consume(&buffer, 22U);
+    assert(net_buffer_readable(&buffer) == 25U);
+    assert(memcmp(buffer.data + buffer.read_pos,
+                  "efXYZghijklmnopqrstuvwxyz", 25U) == 0);
+    net_buffer_consume(&buffer, 25U);
     assert(net_buffer_readable(&buffer) == 0U);
     net_buffer_destroy(&buffer);
 }

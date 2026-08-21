@@ -115,10 +115,50 @@ static void test_heap_and_memory_limit(void)
     cache_destroy(cache);
 }
 
+static void test_hash_hot_entry_invalidation(void)
+{
+    fake_clock_t clock = {9000U};
+    cache_config_t config = {0};
+    cache_entry_ref_t *entry_ref = NULL;
+    kv_object_t *object;
+    cache_t *cache;
+
+    config.now_ms = fake_now;
+    config.clock_context = &clock;
+    assert(cache_create(&cache, &config) == 0);
+    assert(kv_object_create_hash(&object) == 0);
+    assert(cache_store_object(cache, "hash", 4, object, 9010U, 0) ==
+           CACHE_SET_OK);
+    assert(cache_get_hash_object_ref(cache, "hash", 4, 1,
+                                     &entry_ref) == object);
+    assert(entry_ref != NULL);
+    clock.now_ms = 9010U;
+    assert(cache_get_hash_object_ref(cache, "hash", 4, 1, NULL) == NULL);
+
+    assert(kv_object_create_hash(&object) == 0);
+    assert(cache_store_object(cache, "next", 4, object, 0, 0) == CACHE_SET_OK);
+    assert(cache_get_hash_object_ref(cache, "next", 4, 0, NULL) == object);
+    assert(cache_delete(cache, "next", 4) == 1);
+    assert(cache_get_hash_object_ref(cache, "next", 4, 0, NULL) == NULL);
+    cache_destroy(cache);
+
+    config.max_keys = 1U;
+    assert(cache_create(&cache, &config) == 0);
+    assert(kv_object_create_hash(&object) == 0);
+    assert(cache_store_object(cache, "old", 3, object, 0, 0) == CACHE_SET_OK);
+    assert(cache_get_hash_object_ref(cache, "old", 3, 0, NULL) == object);
+    assert(kv_object_create_hash(&object) == 0);
+    assert(cache_store_object(cache, "new", 3, object, 0, 0) == CACHE_SET_OK);
+    assert(cache_get_hash_object_ref(cache, "old", 3, 0, NULL) == NULL);
+    assert(cache_get_hash_object_ref(cache, "new", 3, 0, NULL) == object);
+    cache_destroy(cache);
+}
+
 int main(void)
 {
     test_lru_and_ttl();
     test_heap_and_memory_limit();
+    test_hash_hot_entry_invalidation();
     puts("test_cache: PASS");
     return 0;
 }
