@@ -1,8 +1,32 @@
 #include "protocol/resp.h"
 
 #include <limits.h>
-#include <stdio.h>
 #include <string.h>
+
+static int encode_unsigned_line(unsigned char prefix,
+                                uint64_t value,
+                                unsigned char *output,
+                                size_t capacity,
+                                size_t *written)
+{
+    unsigned char digits[20];
+    size_t count = 0;
+    size_t index;
+
+    do {
+        digits[count++] = (unsigned char)('0' + value % 10U);
+        value /= 10U;
+    } while (value != 0);
+    if (capacity < count + 3U) return -1;
+    output[0] = prefix;
+    for (index = 0; index < count; ++index) {
+        output[1U + index] = digits[count - index - 1U];
+    }
+    output[count + 1U] = '\r';
+    output[count + 2U] = '\n';
+    *written = count + 3U;
+    return 0;
+}
 
 static int incomplete_or_error(size_t available,
                                int end_of_stream,
@@ -203,17 +227,35 @@ int resp_encode_integer(unsigned char *output,
                         int64_t value,
                         size_t *output_length)
 {
-    int written;
+    uint64_t magnitude;
+    unsigned char digits[20];
+    size_t count = 0;
+    size_t position = 0;
+    size_t index;
 
     if (output == NULL || output_length == NULL || capacity == 0) {
         return -1;
     }
     *output_length = 0;
-    written = snprintf((char *)output, capacity, ":%lld\r\n", (long long)value);
-    if (written < 0 || (size_t)written >= capacity) {
-        return -1;
+    if (value < 0) {
+        if (capacity < 2U) return -1;
+        magnitude = (uint64_t)(-(value + 1)) + 1U;
+    } else {
+        magnitude = (uint64_t)value;
     }
-    *output_length = (size_t)written;
+    do {
+        digits[count++] = (unsigned char)('0' + magnitude % 10U);
+        magnitude /= 10U;
+    } while (magnitude != 0);
+    if (capacity < 1U + (value < 0 ? 1U : 0U) + count + 2U) return -1;
+    output[position++] = ':';
+    if (value < 0) output[position++] = '-';
+    for (index = 0; index < count; ++index) {
+        output[position++] = digits[count - index - 1U];
+    }
+    output[position++] = '\r';
+    output[position++] = '\n';
+    *output_length = position;
     return 0;
 }
 
@@ -223,29 +265,28 @@ int resp_encode_bulk_string(unsigned char *output,
                             size_t length,
                             size_t *output_length)
 {
-    int header_length;
+    size_t header_length;
     size_t total;
 
     if (output == NULL || output_length == NULL || (data == NULL && length != 0)) {
         return -1;
     }
     *output_length = 0;
-    header_length = snprintf((char *)output, capacity, "$%zu\r\n", length);
-    if (header_length < 0 || (size_t)header_length >= capacity) {
+    if (encode_unsigned_line('$', length, output, capacity, &header_length) != 0) {
         return -1;
     }
-    if (length > SIZE_MAX - (size_t)header_length - 2U) {
+    if (length > SIZE_MAX - header_length - 2U) {
         return -1;
     }
-    total = (size_t)header_length + length + 2U;
+    total = header_length + length + 2U;
     if (total > capacity) {
         return -1;
     }
     if (length > 0) {
-        memcpy(output + (size_t)header_length, data, length);
+        memcpy(output + header_length, data, length);
     }
-    output[(size_t)header_length + length] = '\r';
-    output[(size_t)header_length + length + 1U] = '\n';
+    output[header_length + length] = '\r';
+    output[header_length + length + 1U] = '\n';
     *output_length = total;
     return 0;
 }
@@ -270,16 +311,16 @@ int resp_encode_bulk_array(unsigned char *output,
                            size_t element_count,
                            size_t *output_length)
 {
-    int header_length;
+    size_t header_length;
     size_t position;
     size_t index;
 
     if (output == NULL || output_length == NULL ||
         (elements == NULL && element_count != 0)) return -1;
     *output_length = 0;
-    header_length = snprintf((char *)output, capacity, "*%zu\r\n", element_count);
-    if (header_length < 0 || (size_t)header_length >= capacity) return -1;
-    position = (size_t)header_length;
+    if (encode_unsigned_line('*', element_count, output, capacity,
+                             &header_length) != 0) return -1;
+    position = header_length;
     for (index = 0; index < element_count; ++index) {
         size_t encoded = 0;
 

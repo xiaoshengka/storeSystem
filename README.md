@@ -2,9 +2,9 @@
 
 基于 Linux C、非阻塞 Socket 与单线程 epoll Reactor 的内存 KV 缓存服务。
 
-当前发布版本为 `v0.6.0`：顶层动态 Hash keyspace 加入 String、Hash、ZSet 类型
-对象，ZSet 可选择 SkipList 或 RBTree 有序索引。
-NtyCo 与根目录旧 Array/RBTree 仍只作为历史路径保留；AOF rewrite 不属于本阶段。
+当前开发版本为 `v0.6.1`：在 v0.6.0 类型对象基础上优化连续内存布局，并把 AOF
+普通写入与同步统一移到单个 pthread writer。网络仍是单线程 epoll Reactor；不引入
+io_uring。RDB、BGSAVE、AOF rewrite 与混合加载留到 v0.6.2 或后续版本。
 
 ## 架构
 
@@ -15,25 +15,34 @@ Client
   -> String / Hash / ZSet 命令服务
   -> Cache（顶层动态 Hash + TTL 最小堆 + LRU + 统计）
   -> 类型对象（Hash；成员 Hash + SkipList/RBTree ZSet）
-  -> AOF（RESP2 写命令 + 批量 write + 后台 everysec fsync + 启动回放）
+  -> AOF（命令 transaction + chunk SPSC 队列 + writer writev/fdatasync + mmap 回放）
 ```
 
 Reactor 负责连接、非阻塞收发、Pipeline 背压、周期回调和资源回收；协议层只处理
 RESP 字节帧；服务层负责命令语义；Cache 不依赖网络或 RESP；Hash 只负责二进制
-key 的索引。v0.6 集合设计见
+key 的索引。v0.6.1 设计见
+[`docs/v0.6.1-memory-aof.md`](docs/v0.6.1-memory-aof.md)；v0.6 集合设计见
 [`docs/typed-collections-v0.6.md`](docs/typed-collections-v0.6.md)；v0.5.1 AOF 设计见
 [`docs/aof-v0.5.1.md`](docs/aof-v0.5.1.md)；v0.4 Cache 设计见
 [`docs/cache-v0.4.md`](docs/cache-v0.4.md)。
 
+v0.6.1 的 64B Hash/ZSet mixed 长测、Redis 6.2.23 对照和发布门槛状态见
+[`docs/v0.6.1-performance-report.md`](docs/v0.6.1-performance-report.md)。当前
+纯内存 QPS 和 ZSet everysec P99 仍未达到既定门槛，因此版本仍处于开发状态。
+
 ## 环境与构建
 
-验证目标环境：Ubuntu 22.04.5、GCC、GNU Make。
+验证目标环境：Ubuntu 22.04.5、GCC、GNU Make、pkg-config 和 jemalloc。
 
 ```bash
 git clone --recurse-submodules https://github.com/xiaoshengka/storeSystem.git
 cd storeSystem
+sudo apt-get install build-essential pkg-config libjemalloc-dev
 make
 ```
+
+默认构建要求 jemalloc 且缺失时直接失败。仅诊断 allocator 差异时可使用
+`make ALLOCATOR=libc`；ASan/UBSan 和 Valgrind 目标自动使用 libc allocator。
 
 默认构建生成：
 
@@ -117,6 +126,8 @@ AOF 只记录实际改变 Cache 的写操作：
 | `TTL key` / `PTTL key` | 查询剩余 TTL | Integer |
 | `PERSIST key` | 清除 TTL | Integer `1` 或 `0` |
 | `INFO CACHE` | 查询缓存统计 | Bulk String |
+| `INFO PERSISTENCE` | 查询 AOF 队列、序号、字节、背压与错误状态 | Bulk String |
+| `DBSIZE` | 查询顶层 key 数，供恢复校验使用 | Integer |
 | `PING [message]` | 探活或回显 | Simple/Bulk String |
 | `HSET key field value [field value ...]` | 新增或更新 field | 新增 field 数 |
 | `HGET key field` | 查询 field | Bulk String 或 Null Bulk |
@@ -167,6 +178,7 @@ make integration-test
 make benchmark-test
 make asan
 make valgrind
+make helgrind
 ```
 
 - 单元测试覆盖缓冲区、RESP、旧引擎接口、动态 Hash、渐进 rehash、TTL 最小堆、
@@ -175,7 +187,8 @@ make valgrind
   协议错误、真实定时过期、小容量 LRU，以及 AOF 重启恢复、二进制 key/value 和
   绝对 TTL、Pipeline 批量 write、集合命令、两种 ZSet 后端交叉恢复，以及成功响应
   后 SIGKILL 的启动恢复。
-- `make asan` 使用 ASan/UBSan；`make valgrind` 检查单元与集成主路径。
+- `make asan` 使用 ASan/UBSan；`make valgrind` 检查单元与集成主路径；
+  `make helgrind` 专门覆盖 AOF writer 与 Reactor eventfd 协作。
 - `make benchmark-test` 对 AOF 重放脚本和可选延迟采样做小规模 smoke test，不是
   性能基线。
 
@@ -267,7 +280,7 @@ make kvstore collection_bench_client
 python3 bench/redis_collection_compare.py \
   --redis-server /usr/local/bin/redis-server \
   --aof-policies off --repeats 1 \
-  --connections 4 --pipeline 8 \
+  --connections 32 --pipelines 8 \
   --requests 10000 --keyspace 1000 \
   --csv bench/results/redis-6.2.23-smoke.csv
 ```
@@ -278,11 +291,13 @@ python3 bench/redis_collection_compare.py \
 make kvstore collection_bench_client
 python3 bench/redis_collection_compare.py \
   --redis-server /usr/local/bin/redis-server \
-  --repeats 5 --connections 32 --pipeline 16 \
+  --repeats 5 --connections 32 --pipelines 16 \
   --requests 1000000 --keyspace 100000 \
   --csv bench/results/redis-6.2.23-collections.csv
 ```
 
+`--pipelines` 接受单值或逗号列表，例如 `1,4,8,16,32,64,128`；省略时只运行
+Pipeline 16，正式门槛也以 Pipeline 16 为准，各深度独立汇总而不混算中位数。
 默认对 AOF off 运行全部 workload，并对含写 workload 额外运行 `appendfsync no` 和
 `everysec`。CSV 包含 QPS、Mean/P50/P95/P99/P99.9/max、错误数、VmHWM、逻辑
 内存、AOF 大小、共享数据 key、初始/预期/实际 cardinality 和 keyspace 范围；每轮
@@ -344,15 +359,22 @@ Pipeline 指标从整批发送开始计时，两类请求共同承担批次排�
 ```bash
 make kvstore
 python3 bench/aof_replay_bench.py \
-  --sizes 10000,100000,1000000 --repeats 5 --value-size 64 \
+  --redis-server /usr/local/bin/redis-server \
+  --targets project-skiplist,project-rbtree,redis \
+  --workloads string,hash,zset \
+  --sizes 10000,100000,1000000 --repeats 5 \
   --csv bench/results/aof-replay.csv
 ```
 
-脚本直接生成 key 唯一、值长度固定的确定性 RESP2 `SET` AOF，逐个启动真实
-`kvstore`，校验实际回放命令数，并记录：AOF 字节数、纯 `aof_replay` 耗时、进程
+脚本生成 Redis 6.2.23 与本项目都可加载的确定性 RESP2 AOF：唯一 key 的 64B
+`SET`、同一 key 下唯一 field 的 64B `HSET`、同一 key 下唯一 member 的 `ZADD`。
+ZSet 分别由本项目 SkipList/RBTree 和 Redis 加载；String/Hash 本项目只运行一次。
+加载后用 `DBSIZE/GET`、`HLEN/HGET`、`ZCARD/ZSCORE` 校验。脚本记录 AOF 字节数、
+纯 replay 耗时、CPU 时间、进程
 启动到端口可连接耗时、每秒
 回放命令数、MiB/s 和进程 `VmHWM` 峰值 RSS。多轮摘要输出 replay 的
-min/P50/P95/max；原始每轮结果可写入 CSV。纯回放耗时不包含打开文件、Reactor
+min/median/P95/max/CV；逐轮 CSV 标记首轮与后续轮次，另生成 `.summary.csv`。
+本项目纯回放耗时不包含打开文件、Reactor
 初始化和监听，`startup_ready_seconds` 则包含完整可用路径。
 
 重复启动通常会受到 Linux page cache 影响。正式报告应区分冷缓存与热缓存，记录

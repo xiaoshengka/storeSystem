@@ -39,6 +39,9 @@ kv_object_type_t kv_object_type(const kv_object_t *object);
 size_t kv_object_memory_usage(const kv_object_t *object);
 const void *kv_object_string_value(const kv_object_t *object,
                                    size_t *value_length);
+int kv_object_string_update(kv_object_t *object,
+                            const void *value,
+                            size_t value_length);
 
 int kv_object_hash_set(kv_object_t *object,
                        const void *field,

@@ -125,6 +125,7 @@ static int dispatch_request(const unsigned char *input,
                             size_t *consumed,
                             size_t *response_length,
                             int *close_after_response,
+                            uint64_t *response_barrier,
                             void *context)
 {
     kvstore_service_t *service = context;
@@ -135,12 +136,13 @@ static int dispatch_request(const unsigned char *input,
     int parse_result;
 
     if (consumed == NULL || response_length == NULL ||
-        close_after_response == NULL) {
+        close_after_response == NULL || response_barrier == NULL) {
         return REACTOR_HANDLER_ERROR;
     }
     *consumed = 0;
     *response_length = 0;
     *close_after_response = 0;
+    *response_barrier = 0;
     parse_result = resp_parse_request(input,
                                       input_length,
                                       end_of_stream,
@@ -167,10 +169,11 @@ static int dispatch_request(const unsigned char *input,
         arguments[index].data = request.arguments[index].data;
         arguments[index].length = request.arguments[index].length;
     }
-    if (kvstore_service_execute(service,
-                                arguments,
-                                request.argument_count,
-                                &reply) != 0 ||
+    if (kvstore_service_execute_with_barrier(service,
+                                             arguments,
+                                             request.argument_count,
+                                             &reply,
+                                             response_barrier) != 0 ||
         encode_reply(&reply,
                      response,
                      response_capacity,
@@ -188,6 +191,13 @@ static int maintain_cache(void *context)
 static int flush_service(void *context)
 {
     return kvstore_service_flush(context);
+}
+
+static int aof_barrier_ready(uint64_t sequence, void *context)
+{
+    kvstore_service_t *service = context;
+
+    return aof_sequence_ready(service->aof, sequence);
 }
 
 static int suffix_equals(const char *value, const char *expected)
@@ -432,9 +442,17 @@ int main(int argc, char **argv)
         perror("reactor_set_flush_handler");
         goto cleanup_reactor;
     }
+    if (aof != NULL &&
+        (aof_set_notify_fd(aof, reactor_wake_fd(reactor)) != 0 ||
+         reactor_set_response_barrier(reactor,
+                                      aof_barrier_ready,
+                                      &service) != 0)) {
+        perror("aof response barrier");
+        goto cleanup_reactor;
+    }
 
     active_reactor = reactor;
-    printf("storeSystem v0.6.0 RESP reactor listening on port %u "
+    printf("storeSystem v0.6.1 RESP reactor listening on port %u "
            "(keyspace=hash, zset=%s, maxmemory=%zu, maxkeys=%zu, "
            "aof=%s, loaded=%zu)\n",
            DEFAULT_PORT,

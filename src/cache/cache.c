@@ -441,6 +441,31 @@ int cache_store_object(cache_t *cache,
     }
 
     if (entry != NULL) {
+        if (kv_object_type(entry->object) == KV_OBJECT_STRING &&
+            kv_object_type(object) == KV_OBJECT_STRING) {
+            size_t value_length = 0;
+            const void *value = kv_object_string_value(object, &value_length);
+            int updated = kv_object_string_update(entry->object,
+                                                  value,
+                                                  value_length);
+
+            if (updated < 0) return CACHE_SET_ERROR;
+            if (updated > 0) {
+                kv_object_destroy(object);
+                if (entry->expire_at_ms != 0 && expire_at == 0) {
+                    heap_remove_at(cache, entry->heap_index);
+                } else if (entry->expire_at_ms == 0 && expire_at != 0) {
+                    entry->expire_at_ms = expire_at;
+                    heap_insert_reserved(cache, entry);
+                } else if (entry->expire_at_ms != 0 && expire_at != 0) {
+                    entry->expire_at_ms = expire_at;
+                    heap_expiration_changed(cache, entry);
+                }
+                entry->expire_at_ms = expire_at;
+                lru_touch(cache, entry);
+                return CACHE_SET_OK;
+            }
+        }
         size_t projected_memory = cache->used_memory - entry->memory_charge +
                                   new_charge;
 

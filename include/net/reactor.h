@@ -20,9 +20,11 @@ typedef int (*reactor_request_handler)(const unsigned char *input,
                                        size_t *consumed,
                                        size_t *response_length,
                                        int *close_after_response,
+                                       uint64_t *response_barrier,
                                        void *context);
 typedef int (*reactor_periodic_handler)(void *context);
 typedef int (*reactor_flush_handler)(void *context);
+typedef int (*reactor_barrier_ready_handler)(uint64_t sequence, void *context);
 
 int reactor_init(reactor_t **out_reactor,
                  uint16_t port,
@@ -36,6 +38,10 @@ int reactor_set_periodic(reactor_t *reactor,
 int reactor_set_flush_handler(reactor_t *reactor,
                               reactor_flush_handler handler,
                               void *handler_context);
+int reactor_set_response_barrier(reactor_t *reactor,
+                                 reactor_barrier_ready_handler handler,
+                                 void *handler_context);
+int reactor_wake_fd(reactor_t *reactor);
 void reactor_stop(reactor_t *reactor);
 void reactor_destroy(reactor_t *reactor);
 

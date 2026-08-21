@@ -41,6 +41,7 @@ enum service_command {
     SERVICE_COMMAND_PTTL,
     SERVICE_COMMAND_PERSIST,
     SERVICE_COMMAND_INFO,
+    SERVICE_COMMAND_DBSIZE,
     SERVICE_COMMAND_HSET,
     SERVICE_COMMAND_HGET,
     SERVICE_COMMAND_HDEL,
@@ -90,6 +91,7 @@ static enum service_command find_command(const kvstore_argument_t *argument)
     if (argument_equals(argument, "PTTL")) return SERVICE_COMMAND_PTTL;
     if (argument_equals(argument, "PERSIST")) return SERVICE_COMMAND_PERSIST;
     if (argument_equals(argument, "INFO")) return SERVICE_COMMAND_INFO;
+    if (argument_equals(argument, "DBSIZE")) return SERVICE_COMMAND_DBSIZE;
     if (argument_equals(argument, "HSET")) return SERVICE_COMMAND_HSET;
     if (argument_equals(argument, "HGET")) return SERVICE_COMMAND_HGET;
     if (argument_equals(argument, "HDEL")) return SERVICE_COMMAND_HDEL;
@@ -1270,6 +1272,8 @@ static int command_arity_valid(enum service_command command,
         return argument_count == 3U;
     case SERVICE_COMMAND_PING:
         return argument_count == 1U || argument_count == 2U;
+    case SERVICE_COMMAND_DBSIZE:
+        return argument_count == 1U;
     case SERVICE_COMMAND_INFO:
         return argument_count == 2U;
     case SERVICE_COMMAND_HSET:
@@ -1285,10 +1289,13 @@ static int command_arity_valid(enum service_command command,
     }
 }
 
-int kvstore_service_execute(kvstore_service_t *service,
-                            const kvstore_argument_t *arguments,
-                            size_t argument_count,
-                            kvstore_reply_t *reply)
+static int execute_persistence_info(kvstore_service_t *service,
+                                    kvstore_reply_t *reply);
+
+static int execute_command(kvstore_service_t *service,
+                           const kvstore_argument_t *arguments,
+                           size_t argument_count,
+                           kvstore_reply_t *reply)
 {
     enum service_command command;
 
@@ -1403,11 +1410,22 @@ int kvstore_service_execute(kvstore_service_t *service,
         }
         return 0;
     case SERVICE_COMMAND_INFO:
+        if (argument_equals(&arguments[1], "PERSISTENCE")) {
+            return execute_persistence_info(service, reply);
+        }
         if (!argument_equals(&arguments[1], "CACHE")) {
             set_error(reply, error_syntax, sizeof(error_syntax) - 1U);
             return 0;
         }
         return execute_info(service, reply);
+    case SERVICE_COMMAND_DBSIZE:
+        {
+            cache_stats_t stats;
+
+            cache_get_stats(service->cache, &stats);
+            set_integer(reply, (int64_t)stats.keys);
+        }
+        return 0;
     case SERVICE_COMMAND_HSET:
         return execute_hset(service, arguments, argument_count, reply);
     case SERVICE_COMMAND_HGET:
@@ -1518,6 +1536,98 @@ int kvstore_service_execute(kvstore_service_t *service,
     default:
         return -1;
     }
+}
+
+int kvstore_service_execute_with_barrier(kvstore_service_t *service,
+                                         const kvstore_argument_t *arguments,
+                                         size_t argument_count,
+                                         kvstore_reply_t *reply,
+                                         uint64_t *response_barrier)
+{
+    enum service_command command;
+    int write_command;
+    int result;
+
+    if (response_barrier != NULL) *response_barrier = 0;
+    if (service == NULL || arguments == NULL || argument_count == 0 ||
+        reply == NULL) return -1;
+    command = find_command(&arguments[0]);
+    write_command = command != SERVICE_COMMAND_UNKNOWN &&
+                    command_arity_valid(command, argument_count) &&
+                    is_write_command(command) && service->aof != NULL;
+    if (write_command && aof_transaction_begin(service->aof) != 0) {
+        static const unsigned char busy[] =
+            "TRYAGAIN AOF writer queue is above the high-water mark";
+
+        memset(reply, 0, sizeof(*reply));
+        set_error(reply, busy, sizeof(busy) - 1U);
+        return 0;
+    }
+    result = execute_command(service, arguments, argument_count, reply);
+    if (!write_command) return result;
+    if (result != 0) {
+        aof_transaction_rollback(service->aof);
+        return result;
+    }
+    if (aof_transaction_commit(service->aof, response_barrier) != 0) {
+        aof_transaction_rollback(service->aof);
+        set_aof_error(reply);
+    }
+    return 0;
+}
+
+static int execute_persistence_info(kvstore_service_t *service,
+                                    kvstore_reply_t *reply)
+{
+    aof_info_t info;
+    int written;
+
+    aof_get_info(service->aof, &info);
+    written = snprintf((char *)service->info_buffer,
+                       sizeof(service->info_buffer),
+                       "aof_enabled:%d\r\n"
+                       "aof_queue_bytes:%zu\r\n"
+                       "aof_queue_high_water:%zu\r\n"
+                       "aof_queue_low_water:%zu\r\n"
+                       "aof_enqueued_sequence:%" PRIu64 "\r\n"
+                       "aof_written_sequence:%" PRIu64 "\r\n"
+                       "aof_synced_sequence:%" PRIu64 "\r\n"
+                       "aof_written_bytes:%" PRIu64 "\r\n"
+                       "aof_backpressure_events:%" PRIu64 "\r\n"
+                       "aof_backpressured:%d\r\n"
+                       "aof_failed:%d\r\n"
+                       "aof_last_error:%d\r\n",
+                       service->aof != NULL,
+                       info.queue_bytes,
+                       info.queue_high_water,
+                       info.queue_low_water,
+                       info.enqueued_sequence,
+                       info.written_sequence,
+                       info.synced_sequence,
+                       info.written_bytes,
+                       info.backpressure_events,
+                       info.backpressured,
+                       info.failed,
+                       info.last_error);
+    if (written < 0 || (size_t)written >= sizeof(service->info_buffer)) {
+        set_error(reply, error_internal, sizeof(error_internal) - 1U);
+    } else {
+        set_data_reply(reply, KVSTORE_REPLY_BULK, service->info_buffer,
+                       (size_t)written);
+    }
+    return 0;
+}
+
+int kvstore_service_execute(kvstore_service_t *service,
+                            const kvstore_argument_t *arguments,
+                            size_t argument_count,
+                            kvstore_reply_t *reply)
+{
+    return kvstore_service_execute_with_barrier(service,
+                                                arguments,
+                                                argument_count,
+                                                reply,
+                                                NULL);
 }
 
 static int replay_argument_equals(const aof_argument_t *argument,
