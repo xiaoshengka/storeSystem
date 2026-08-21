@@ -42,6 +42,7 @@ struct reactor_connection {
     uint32_t events;
     int peer_eof;
     int close_after_write;
+    uint64_t response_barrier;
     net_buffer_t input;
     net_buffer_t output;
     reactor_connection_t *previous;
@@ -61,6 +62,8 @@ struct reactor {
     void *periodic_context;
     reactor_flush_handler flush_handler;
     void *flush_context;
+    reactor_barrier_ready_handler barrier_handler;
+    void *barrier_context;
     reactor_connection_t *clients;
     unsigned char *response_scratch;
 };
@@ -282,8 +285,11 @@ static int handle_accept(reactor_t *reactor)
 static int refresh_client_events(reactor_connection_t *connection)
 {
     uint32_t events = EPOLLRDHUP;
+    int response_ready = connection->owner->barrier_handler == NULL ||
+        connection->owner->barrier_handler(connection->response_barrier,
+                                           connection->owner->barrier_context);
 
-    if (net_buffer_readable(&connection->output) > 0) {
+    if (net_buffer_readable(&connection->output) > 0 && response_ready) {
         events |= EPOLLOUT;
     }
     if (!connection->peer_eof && !connection->close_after_write &&
@@ -303,6 +309,7 @@ static int process_input(reactor_connection_t *connection)
         size_t available = net_buffer_readable(&connection->input);
         size_t consumed = 0;
         size_t response_length = 0;
+        uint64_t response_barrier = 0;
         int close_after_response = 0;
         int result = connection->owner->handler(
             (const unsigned char *)connection->input.data + connection->input.read_pos,
@@ -313,6 +320,7 @@ static int process_input(reactor_connection_t *connection)
             &consumed,
             &response_length,
             &close_after_response,
+            &response_barrier,
             connection->owner->handler_context);
 
         if (result == REACTOR_HANDLER_INCOMPLETE) {
@@ -331,6 +339,9 @@ static int process_input(reactor_connection_t *connection)
         if (response_length > 0 &&
             net_buffer_append(&connection->output, response, response_length) != 0) {
             return -1;
+        }
+        if (response_barrier > connection->response_barrier) {
+            connection->response_barrier = response_barrier;
         }
         if (close_after_response) {
             connection->close_after_write = 1;
@@ -383,6 +394,9 @@ static int handle_write(reactor_connection_t *connection)
     if (result < 0) {
         return -1;
     }
+    if (net_buffer_readable(&connection->output) == 0) {
+        connection->response_barrier = 0;
+    }
     if (result == 0) {
         return refresh_client_events(connection);
     }
@@ -401,8 +415,18 @@ static int handle_write(reactor_connection_t *connection)
 static void drain_wake_fd(reactor_t *reactor)
 {
     uint64_t value;
+    reactor_connection_t *connection;
 
     while (read(reactor->wake_source->fd, &value, sizeof(value)) < 0 && errno == EINTR) {
+    }
+    connection = reactor->clients;
+    while (connection != NULL) {
+        reactor_connection_t *next = connection->next;
+
+        if (refresh_client_events(connection) != 0) {
+            connection_destroy(connection);
+        }
+        connection = next;
     }
 }
 
@@ -590,6 +614,25 @@ int reactor_set_flush_handler(reactor_t *reactor,
     reactor->flush_handler = handler;
     reactor->flush_context = handler_context;
     return 0;
+}
+
+int reactor_set_response_barrier(reactor_t *reactor,
+                                 reactor_barrier_ready_handler handler,
+                                 void *handler_context)
+{
+    if (reactor == NULL || handler == NULL || reactor->barrier_handler != NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    reactor->barrier_handler = handler;
+    reactor->barrier_context = handler_context;
+    return 0;
+}
+
+int reactor_wake_fd(reactor_t *reactor)
+{
+    return reactor == NULL || reactor->wake_source == NULL
+               ? -1 : reactor->wake_source->fd;
 }
 
 int reactor_set_periodic(reactor_t *reactor,

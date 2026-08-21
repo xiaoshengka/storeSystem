@@ -1,100 +1,76 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include "persistence/aof.h"
-
 #include "protocol/resp.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <stdatomic.h>
+#include <signal.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
 #define AOF_MAX_RECORD_SIZE (RESP_MAX_FRAME_SIZE + 1024U)
-#define AOF_BUFFER_CAPACITY (256U * 1024U)
-#define AOF_FLUSH_THRESHOLD (64U * 1024U)
+#define AOF_CHUNK_CAPACITY (256U * 1024U)
+#define AOF_QUEUE_HIGH_WATER (4U * 1024U * 1024U)
+#define AOF_QUEUE_LOW_WATER (2U * 1024U * 1024U)
+#define AOF_WRITEV_MAX 16U
+
+typedef struct aof_chunk {
+    struct aof_chunk *next;
+    size_t length;
+    size_t offset;
+    uint64_t sequence;
+    int sequence_end;
+    unsigned char data[AOF_CHUNK_CAPACITY];
+} aof_chunk_t;
 
 struct aof {
     int fd;
+    int notify_fd;
     aof_fsync_policy_t fsync_policy;
-    unsigned char *buffer;
-    size_t buffer_used;
-    size_t buffer_capacity;
-    uint64_t last_sync_request_ms;
-    int failed;
-    int last_error;
-
-    pthread_t sync_thread;
-    pthread_mutex_t sync_mutex;
-    pthread_cond_t sync_condition;
-    int sync_thread_started;
-    int sync_stop;
-    int sync_requested;
-    uint64_t write_generation;
-    uint64_t requested_generation;
-    uint64_t syncing_generation;
-    uint64_t synced_generation;
-    atomic_int async_error;
+    pthread_t writer_thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    int writer_started;
+    int stopping;
+    aof_chunk_t *queue_head;
+    aof_chunk_t *queue_tail;
+    aof_chunk_t *free_chunks;
+    aof_chunk_t *producer_chunk;
+    size_t queue_bytes;
+    uint64_t next_sequence;
+    uint64_t written_sequence;
+    uint64_t synced_sequence;
+    uint64_t written_bytes;
+    uint64_t backpressure_events;
+    int backpressured;
+    int async_error;
+    unsigned char *pending;
+    size_t pending_used;
+    size_t pending_capacity;
+    unsigned char *transaction;
+    size_t transaction_used;
+    size_t transaction_capacity;
+    int transaction_active;
 };
-
-static uint64_t monotonic_now_ms(void)
-{
-    struct timespec value;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
-        return 0;
-    }
-    return (uint64_t)value.tv_sec * 1000U +
-           (uint64_t)value.tv_nsec / 1000000U;
-}
-
-static void remember_failure(aof_t *aof, int error_number)
-{
-    if (!aof->failed) {
-        aof->failed = 1;
-        aof->last_error = error_number == 0 ? EIO : error_number;
-    }
-}
-
-static int check_async_failure(aof_t *aof)
-{
-    int error_number;
-
-    if (aof->failed) {
-        errno = aof->last_error;
-        return -1;
-    }
-    error_number = atomic_load_explicit(&aof->async_error,
-                                        memory_order_acquire);
-    if (error_number != 0) {
-        remember_failure(aof, error_number);
-        errno = aof->last_error;
-        return -1;
-    }
-    return 0;
-}
 
 static size_t decimal_length(size_t value)
 {
     size_t length = 1U;
-
-    while (value >= 10U) {
-        value /= 10U;
-        length++;
-    }
+    while (value >= 10U) { value /= 10U; length++; }
     return length;
 }
 
 static int checked_add(size_t *total, size_t amount)
 {
-    if (amount > SIZE_MAX - *total) {
-        return -1;
-    }
+    if (amount > SIZE_MAX - *total) return -1;
     *total += amount;
     return 0;
 }
@@ -107,548 +83,556 @@ static int encoded_size(const aof_argument_t *arguments,
     size_t index;
 
     if (arguments == NULL || result == NULL || argument_count == 0 ||
-        argument_count > RESP_MAX_ARGUMENTS) {
-        errno = EINVAL;
-        return -1;
-    }
+        argument_count > RESP_MAX_ARGUMENTS) { errno = EINVAL; return -1; }
     total = 1U + decimal_length(argument_count) + 2U;
     for (index = 0; index < argument_count; ++index) {
         if (arguments[index].data == NULL && arguments[index].length != 0) {
-            errno = EINVAL;
-            return -1;
+            errno = EINVAL; return -1;
         }
-        if (checked_add(&total,
-                        1U + decimal_length(arguments[index].length) + 2U) != 0 ||
+        if (checked_add(&total, 1U + decimal_length(arguments[index].length) + 2U) != 0 ||
             checked_add(&total, arguments[index].length) != 0 ||
-            checked_add(&total, 2U) != 0) {
-            errno = EOVERFLOW;
-            return -1;
-        }
+            checked_add(&total, 2U) != 0) { errno = EOVERFLOW; return -1; }
     }
-    if (total > AOF_MAX_RECORD_SIZE) {
-        errno = EFBIG;
-        return -1;
-    }
+    if (total > AOF_MAX_RECORD_SIZE) { errno = EFBIG; return -1; }
     *result = total;
     return 0;
 }
 
-static int encode_record(unsigned char *output,
-                         size_t capacity,
+static size_t encode_unsigned(unsigned char prefix, size_t value,
+                              unsigned char *output)
+{
+    unsigned char reverse[32];
+    size_t count = 0;
+    size_t position = 0;
+    size_t index;
+
+    do { reverse[count++] = (unsigned char)('0' + value % 10U); value /= 10U; }
+    while (value != 0);
+    output[position++] = prefix;
+    for (index = 0; index < count; ++index) output[position++] = reverse[count - index - 1U];
+    output[position++] = '\r';
+    output[position++] = '\n';
+    return position;
+}
+
+static int encode_record(unsigned char *output, size_t capacity,
                          const aof_argument_t *arguments,
-                         size_t argument_count,
-                         size_t expected_length)
+                         size_t argument_count, size_t expected_length)
 {
     size_t position;
     size_t index;
-    int written;
 
-    if (output == NULL || capacity < expected_length) {
-        errno = ENOBUFS;
-        return -1;
-    }
-    written = snprintf((char *)output, capacity, "*%zu\r\n", argument_count);
-    if (written < 0 || (size_t)written >= capacity) {
-        errno = EINVAL;
-        return -1;
-    }
-    position = (size_t)written;
+    if (output == NULL || capacity < expected_length) { errno = ENOBUFS; return -1; }
+    position = encode_unsigned('*', argument_count, output);
     for (index = 0; index < argument_count; ++index) {
-        written = snprintf((char *)output + position,
-                           capacity - position,
-                           "$%zu\r\n",
-                           arguments[index].length);
-        if (written < 0 || (size_t)written >= capacity - position) {
-            errno = EINVAL;
-            return -1;
-        }
-        position += (size_t)written;
+        position += encode_unsigned('$', arguments[index].length, output + position);
         if (arguments[index].length > 0) {
-            memcpy(output + position,
-                   arguments[index].data,
-                   arguments[index].length);
+            memcpy(output + position, arguments[index].data, arguments[index].length);
         }
         position += arguments[index].length;
         output[position++] = '\r';
         output[position++] = '\n';
     }
-    if (position != expected_length) {
-        errno = EINVAL;
-        return -1;
-    }
+    if (position != expected_length) { errno = EINVAL; return -1; }
     return 0;
 }
 
-static int write_all(aof_t *aof, const unsigned char *data, size_t length)
+static int reserve_bytes(unsigned char **buffer, size_t *capacity, size_t needed)
 {
-    size_t written = 0;
+    size_t next;
+    unsigned char *replacement;
 
-    while (written < length) {
-        ssize_t result = write(aof->fd, data + written, length - written);
-
-        if (result < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            remember_failure(aof, errno);
-            return -1;
-        }
-        if (result == 0) {
-            remember_failure(aof, EIO);
-            errno = EIO;
-            return -1;
-        }
-        written += (size_t)result;
+    if (needed <= *capacity) return 0;
+    next = *capacity == 0 ? AOF_CHUNK_CAPACITY : *capacity;
+    while (next < needed) {
+        if (next > SIZE_MAX / 2U) { errno = EOVERFLOW; return -1; }
+        next *= 2U;
     }
+    replacement = realloc(*buffer, next);
+    if (replacement == NULL) return -1;
+    *buffer = replacement;
+    *capacity = next;
     return 0;
 }
 
-static void note_completed_write(aof_t *aof)
+static void notify_reactor(aof_t *aof)
 {
-    if (aof->sync_thread_started) {
-        pthread_mutex_lock(&aof->sync_mutex);
-        aof->write_generation++;
-        pthread_mutex_unlock(&aof->sync_mutex);
+    uint64_t value = 1U;
+    if (aof->notify_fd >= 0) {
+        ssize_t ignored = write(aof->notify_fd, &value, sizeof(value));
+        (void)ignored;
+    }
+}
+
+static void publish_error(aof_t *aof, int error_number)
+{
+    if (error_number == 0) error_number = EIO;
+    pthread_mutex_lock(&aof->mutex);
+    if (aof->async_error == 0) {
+        aof->async_error = error_number;
+        pthread_cond_broadcast(&aof->condition);
+        pthread_mutex_unlock(&aof->mutex);
+        notify_reactor(aof);
     } else {
-        aof->write_generation++;
+        pthread_mutex_unlock(&aof->mutex);
     }
 }
 
-static int sync_file_direct(aof_t *aof)
+static aof_chunk_t *acquire_chunk_locked(aof_t *aof)
 {
-    if (fdatasync(aof->fd) != 0) {
-        remember_failure(aof, errno);
-        return -1;
+    aof_chunk_t *chunk = aof->free_chunks;
+
+    if (chunk != NULL) aof->free_chunks = chunk->next;
+    return chunk == NULL ? malloc(sizeof(*chunk)) : chunk;
+}
+
+static aof_chunk_t *acquire_chunk(aof_t *aof)
+{
+    aof_chunk_t *chunk;
+
+    pthread_mutex_lock(&aof->mutex);
+    chunk = acquire_chunk_locked(aof);
+    pthread_mutex_unlock(&aof->mutex);
+    return chunk;
+}
+
+static void queue_chunk_locked(aof_t *aof, aof_chunk_t *chunk)
+{
+    chunk->next = NULL;
+    if (aof->queue_tail == NULL) aof->queue_head = chunk;
+    else aof->queue_tail->next = chunk;
+    aof->queue_tail = chunk;
+    aof->queue_bytes += chunk->length;
+    if (aof->queue_bytes >= AOF_QUEUE_HIGH_WATER && !aof->backpressured) {
+        aof->backpressured = 1;
+        aof->backpressure_events++;
     }
-    aof->synced_generation = aof->write_generation;
-    aof->last_sync_request_ms = monotonic_now_ms();
+    pthread_cond_signal(&aof->condition);
+}
+
+static int enqueue_bytes(aof_t *aof, const unsigned char *data, size_t length,
+                         uint64_t *sequence)
+{
+    aof_chunk_t *first = NULL;
+    aof_chunk_t *last = NULL;
+    size_t position = 0;
+    uint64_t assigned;
+
+    if (sequence != NULL) *sequence = 0;
+    if (length == 0) return 0;
+    while (position < length) {
+        size_t amount = length - position;
+        aof_chunk_t *chunk = acquire_chunk(aof);
+        if (chunk == NULL) {
+            while (first != NULL) { chunk = first->next; free(first); first = chunk; }
+            return -1;
+        }
+        if (amount > AOF_CHUNK_CAPACITY) amount = AOF_CHUNK_CAPACITY;
+        chunk->next = NULL; chunk->length = amount; chunk->offset = 0;
+        chunk->sequence = 0; chunk->sequence_end = 0;
+        memcpy(chunk->data, data + position, amount);
+        if (last == NULL) first = chunk; else last->next = chunk;
+        last = chunk;
+        position += amount;
+    }
+    pthread_mutex_lock(&aof->mutex);
+    assigned = ++aof->next_sequence;
+    last->sequence = assigned;
+    last->sequence_end = 1;
+    while (first != NULL) {
+        aof_chunk_t *next = first->next;
+
+        queue_chunk_locked(aof, first);
+        first = next;
+    }
+    pthread_mutex_unlock(&aof->mutex);
+    if (sequence != NULL) *sequence = assigned;
     return 0;
 }
 
-static void publish_async_error(aof_t *aof, int error_number)
+static int sync_written(aof_t *aof, uint64_t target)
 {
-    int expected = 0;
-
-    if (error_number == 0) {
-        error_number = EIO;
-    }
-    (void)atomic_compare_exchange_strong_explicit(&aof->async_error,
-                                                  &expected,
-                                                  error_number,
-                                                  memory_order_release,
-                                                  memory_order_relaxed);
+    if (target <= aof->synced_sequence) return 0;
+    if (fdatasync(aof->fd) != 0) return -1;
+    aof->synced_sequence = target;
+    return 0;
 }
 
-static void *sync_worker(void *context)
+/* Called with mutex held. */
+static int consume_written(aof_t *aof, size_t amount)
+{
+    while (amount > 0) {
+        aof_chunk_t *chunk = aof->queue_head;
+        size_t available = chunk->length - chunk->offset;
+        size_t consumed = amount < available ? amount : available;
+        chunk->offset += consumed;
+        aof->queue_bytes -= consumed;
+        amount -= consumed;
+        if (chunk->offset == chunk->length) {
+            uint64_t sequence = chunk->sequence;
+            int sequence_end = chunk->sequence_end;
+            aof->queue_head = chunk->next;
+            if (aof->queue_head == NULL) aof->queue_tail = NULL;
+            chunk->next = aof->free_chunks;
+            aof->free_chunks = chunk;
+            if (sequence_end) {
+                if (aof->fsync_policy == AOF_FSYNC_ALWAYS && sync_written(aof, sequence) != 0) return -1;
+                aof->written_sequence = sequence;
+                notify_reactor(aof);
+            }
+        }
+    }
+    if (aof->queue_bytes <= AOF_QUEUE_LOW_WATER) {
+        aof->backpressured = 0;
+    }
+    pthread_cond_broadcast(&aof->condition);
+    return 0;
+}
+
+static void realtime_after_one_second(struct timespec *deadline)
+{
+    if (clock_gettime(CLOCK_REALTIME, deadline) != 0) {
+        deadline->tv_sec = 1; deadline->tv_nsec = 0;
+    } else deadline->tv_sec++;
+}
+
+static void *writer_main(void *context)
 {
     aof_t *aof = context;
+    sigset_t signals;
+
+    sigfillset(&signals);
+    (void)pthread_sigmask(SIG_BLOCK, &signals, NULL);
 
     for (;;) {
-        uint64_t target;
-        int result;
-        int error_number;
+        struct iovec vectors[AOF_WRITEV_MAX];
+        size_t count = 0;
+        aof_chunk_t *chunk;
+        ssize_t result;
 
-        pthread_mutex_lock(&aof->sync_mutex);
-        while (!aof->sync_requested && !aof->sync_stop) {
-            pthread_cond_wait(&aof->sync_condition, &aof->sync_mutex);
-        }
-        if (!aof->sync_requested && aof->sync_stop) {
-            pthread_mutex_unlock(&aof->sync_mutex);
-            break;
-        }
-        target = aof->requested_generation;
-        aof->sync_requested = 0;
-        aof->syncing_generation = target;
-        pthread_mutex_unlock(&aof->sync_mutex);
+        pthread_mutex_lock(&aof->mutex);
+        while (aof->queue_head == NULL && !aof->stopping) {
+            if (aof->fsync_policy == AOF_FSYNC_EVERYSEC) {
+                struct timespec deadline;
+                int waited;
+                realtime_after_one_second(&deadline);
+                waited = pthread_cond_timedwait(&aof->condition, &aof->mutex, &deadline);
+                if (waited == ETIMEDOUT) {
+                    uint64_t written = aof->written_sequence;
+                    if (sync_written(aof, written) != 0) {
+                        int saved_errno = errno;
 
-        result = fdatasync(aof->fd);
-        error_number = errno;
-
-        pthread_mutex_lock(&aof->sync_mutex);
-        aof->syncing_generation = 0;
-        if (result == 0 && target > aof->synced_generation) {
-            aof->synced_generation = target;
+                        pthread_mutex_unlock(&aof->mutex);
+                        publish_error(aof, saved_errno);
+                        return NULL;
+                    }
+                }
+            } else pthread_cond_wait(&aof->condition, &aof->mutex);
         }
-        pthread_cond_broadcast(&aof->sync_condition);
-        pthread_mutex_unlock(&aof->sync_mutex);
-
-        if (result != 0) {
-            publish_async_error(aof, error_number);
-            break;
+        if (aof->queue_head == NULL && aof->stopping) { pthread_mutex_unlock(&aof->mutex); break; }
+        chunk = aof->queue_head;
+        while (chunk != NULL && count < AOF_WRITEV_MAX) {
+            vectors[count].iov_base = chunk->data + chunk->offset;
+            vectors[count].iov_len = chunk->length - chunk->offset;
+            count++;
+            chunk = chunk->next;
         }
+        pthread_mutex_unlock(&aof->mutex);
+        do { result = writev(aof->fd, vectors, (int)count); } while (result < 0 && errno == EINTR);
+        if (result <= 0) { publish_error(aof, result == 0 ? EIO : errno); break; }
+        pthread_mutex_lock(&aof->mutex);
+        aof->written_bytes += (uint64_t)result;
+        if (consume_written(aof, (size_t)result) != 0) {
+            int saved_errno = errno;
+            pthread_mutex_unlock(&aof->mutex);
+            publish_error(aof, saved_errno);
+            return NULL;
+        }
+        pthread_mutex_unlock(&aof->mutex);
+    }
+    if (aof->fsync_policy == AOF_FSYNC_EVERYSEC) {
+        uint64_t written;
+
+        pthread_mutex_lock(&aof->mutex);
+        written = aof->written_sequence;
+        if (sync_written(aof, written) != 0) {
+            int saved_errno = errno;
+
+            pthread_mutex_unlock(&aof->mutex);
+            publish_error(aof, saved_errno);
+            return NULL;
+        }
+        pthread_mutex_unlock(&aof->mutex);
     }
     return NULL;
 }
 
-static int start_sync_worker(aof_t *aof)
-{
-    int result;
-
-    if (aof->fsync_policy != AOF_FSYNC_EVERYSEC) {
-        return 0;
-    }
-    result = pthread_create(&aof->sync_thread, NULL, sync_worker, aof);
-    if (result != 0) {
-        errno = result;
-        return -1;
-    }
-    aof->sync_thread_started = 1;
-    return 0;
-}
-
-static void request_sync_locked(aof_t *aof, uint64_t generation)
-{
-    if (generation > aof->requested_generation) {
-        aof->requested_generation = generation;
-    }
-    aof->sync_requested = 1;
-    pthread_cond_signal(&aof->sync_condition);
-}
-
-static int stop_sync_worker(aof_t *aof, int request_final_sync)
-{
-    int result;
-
-    if (!aof->sync_thread_started) {
-        return 0;
-    }
-    pthread_mutex_lock(&aof->sync_mutex);
-    if (request_final_sync &&
-        aof->write_generation > aof->synced_generation &&
-        aof->write_generation > aof->syncing_generation) {
-        request_sync_locked(aof, aof->write_generation);
-    }
-    aof->sync_stop = 1;
-    pthread_cond_broadcast(&aof->sync_condition);
-    pthread_mutex_unlock(&aof->sync_mutex);
-
-    result = pthread_join(aof->sync_thread, NULL);
-    aof->sync_thread_started = 0;
-    if (result != 0) {
-        errno = result;
-        return -1;
-    }
-    return 0;
-}
-
-int aof_open(aof_t **out_aof,
-             const char *path,
-             aof_fsync_policy_t fsync_policy)
+int aof_open(aof_t **out_aof, const char *path, aof_fsync_policy_t fsync_policy)
 {
     aof_t *aof;
-    int fd;
     int result;
 
     if (out_aof == NULL || path == NULL || path[0] == '\0' ||
-        (fsync_policy != AOF_FSYNC_ALWAYS &&
-         fsync_policy != AOF_FSYNC_EVERYSEC &&
-         fsync_policy != AOF_FSYNC_NO)) {
-        errno = EINVAL;
-        return -1;
+        (fsync_policy != AOF_FSYNC_ALWAYS && fsync_policy != AOF_FSYNC_EVERYSEC && fsync_policy != AOF_FSYNC_NO)) {
+        errno = EINVAL; return -1;
     }
     *out_aof = NULL;
-    fd = open(path, O_CREAT | O_RDWR | O_APPEND | O_CLOEXEC, 0644);
-    if (fd < 0) {
-        return -1;
-    }
     aof = calloc(1, sizeof(*aof));
-    if (aof == NULL) {
-        int saved_errno = errno;
-
-        close(fd);
-        errno = saved_errno;
-        return -1;
-    }
-    aof->buffer = malloc(AOF_BUFFER_CAPACITY);
-    if (aof->buffer == NULL) {
-        int saved_errno = errno;
-
-        close(fd);
-        free(aof);
-        errno = saved_errno;
-        return -1;
-    }
-    aof->fd = fd;
+    if (aof == NULL) return -1;
+    aof->fd = open(path, O_CREAT | O_RDWR | O_APPEND | O_CLOEXEC, 0644);
+    aof->notify_fd = -1;
     aof->fsync_policy = fsync_policy;
-    aof->buffer_capacity = AOF_BUFFER_CAPACITY;
-    aof->last_sync_request_ms = monotonic_now_ms();
-    atomic_init(&aof->async_error, 0);
-    result = pthread_mutex_init(&aof->sync_mutex, NULL);
-    if (result == 0) {
-        result = pthread_cond_init(&aof->sync_condition, NULL);
-        if (result != 0) {
-            pthread_mutex_destroy(&aof->sync_mutex);
-        }
-    }
+    if (aof->fd < 0) { free(aof); return -1; }
+    result = pthread_mutex_init(&aof->mutex, NULL);
+    if (result != 0) { close(aof->fd); free(aof); errno = result; return -1; }
+    result = pthread_cond_init(&aof->condition, NULL);
+    if (result != 0) { pthread_mutex_destroy(&aof->mutex); close(aof->fd); free(aof); errno = result; return -1; }
+    result = pthread_create(&aof->writer_thread, NULL, writer_main, aof);
     if (result != 0) {
-        close(fd);
-        free(aof->buffer);
-        free(aof);
-        errno = result;
-        return -1;
+        pthread_cond_destroy(&aof->condition); pthread_mutex_destroy(&aof->mutex);
+        close(aof->fd); free(aof); errno = result; return -1;
     }
-    if (start_sync_worker(aof) != 0) {
-        int saved_errno = errno;
-
-        pthread_cond_destroy(&aof->sync_condition);
-        pthread_mutex_destroy(&aof->sync_mutex);
-        close(fd);
-        free(aof->buffer);
-        free(aof);
-        errno = saved_errno;
-        return -1;
-    }
+    aof->writer_started = 1;
     *out_aof = aof;
     return 0;
 }
 
-int aof_replay(aof_t *aof,
-               aof_replay_callback callback,
-               void *context,
+int aof_replay(aof_t *aof, aof_replay_callback callback, void *context,
                aof_replay_stats_t *stats)
 {
-    unsigned char *buffer;
-    size_t used = 0;
-    off_t valid_length = 0;
+    struct stat status;
+    unsigned char *mapping;
+    size_t position = 0;
 
-    if (aof == NULL || callback == NULL || check_async_failure(aof) != 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (stats != NULL) {
-        memset(stats, 0, sizeof(*stats));
-    }
-    buffer = aof->buffer;
-    if (lseek(aof->fd, 0, SEEK_SET) < 0) {
-        return -1;
-    }
-    for (;;) {
+    if (aof == NULL || callback == NULL) { errno = EINVAL; return -1; }
+    if (stats != NULL) memset(stats, 0, sizeof(*stats));
+    if (fstat(aof->fd, &status) != 0) return -1;
+    if (status.st_size == 0) return 0;
+    if ((uintmax_t)status.st_size > SIZE_MAX) { errno = EFBIG; return -1; }
+    mapping = mmap(NULL, (size_t)status.st_size, PROT_READ, MAP_PRIVATE, aof->fd, 0);
+    if (mapping == MAP_FAILED) return -1;
+    (void)madvise(mapping, (size_t)status.st_size, MADV_SEQUENTIAL);
+    while (position < (size_t)status.st_size) {
         resp_request_t request;
         size_t consumed = 0;
-        int parse_result;
-
-        if (used > 0) {
-            parse_result = resp_parse_request_with_limit(buffer,
-                                                         used,
-                                                         0,
-                                                         AOF_MAX_RECORD_SIZE,
-                                                         &request,
-                                                         &consumed);
-            if (parse_result == RESP_PARSE_ERROR) {
-                errno = EINVAL;
-                return -1;
-            }
-            if (parse_result == RESP_PARSE_COMPLETE) {
-                aof_argument_t arguments[RESP_MAX_ARGUMENTS];
-                size_t index;
-
-                for (index = 0; index < request.argument_count; ++index) {
-                    arguments[index].data = request.arguments[index].data;
-                    arguments[index].length = request.arguments[index].length;
-                }
-                if (callback(arguments, request.argument_count, context) != 0) {
-                    errno = EINVAL;
-                    return -1;
-                }
-                valid_length += (off_t)consumed;
-                used -= consumed;
-                if (used > 0) {
-                    memmove(buffer, buffer + consumed, used);
-                }
-                if (stats != NULL) {
-                    stats->commands_loaded++;
-                }
-                continue;
-            }
-        }
-        if (used == AOF_MAX_RECORD_SIZE) {
-            errno = EFBIG;
-            return -1;
-        }
+        int parsed = resp_parse_request_with_limit(mapping + position,
+                                                    (size_t)status.st_size - position,
+                                                    0, AOF_MAX_RECORD_SIZE,
+                                                    &request, &consumed);
+        if (parsed == RESP_PARSE_INCOMPLETE) break;
+        if (parsed != RESP_PARSE_COMPLETE) { munmap(mapping, (size_t)status.st_size); errno = EINVAL; return -1; }
         {
-            ssize_t count;
-
-            do {
-                count = read(aof->fd,
-                             buffer + used,
-                             AOF_MAX_RECORD_SIZE - used);
-            } while (count < 0 && errno == EINTR);
-            if (count < 0) {
-                return -1;
+            aof_argument_t arguments[RESP_MAX_ARGUMENTS];
+            size_t index;
+            for (index = 0; index < request.argument_count; ++index) {
+                arguments[index].data = request.arguments[index].data;
+                arguments[index].length = request.arguments[index].length;
             }
-            if (count == 0) {
-                if (used > 0) {
-                    if (ftruncate(aof->fd, valid_length) != 0) {
-                        return -1;
-                    }
-                    if (stats != NULL) {
-                        stats->truncated_tail_repaired = 1;
-                    }
-                }
-                break;
+            if (callback(arguments, request.argument_count, context) != 0) {
+                munmap(mapping, (size_t)status.st_size); errno = EINVAL; return -1;
             }
-            used += (size_t)count;
         }
+        position += consumed;
+        if (stats != NULL) stats->commands_loaded++;
     }
-    if (lseek(aof->fd, 0, SEEK_END) < 0) {
-        return -1;
+    munmap(mapping, (size_t)status.st_size);
+    if (position != (size_t)status.st_size) {
+        if (ftruncate(aof->fd, (off_t)position) != 0) return -1;
+        if (stats != NULL) stats->truncated_tail_repaired = 1;
     }
     return 0;
+}
+
+int aof_append(aof_t *aof, const aof_argument_t *arguments, size_t argument_count)
+{
+    unsigned char **buffer;
+    size_t *used;
+    size_t *capacity;
+    size_t record_length;
+
+    if (aof == NULL || aof_last_error(aof) != 0) { errno = aof == NULL ? EINVAL : aof_last_error(aof); return -1; }
+    if (encoded_size(arguments, argument_count, &record_length) != 0) return -1;
+    if (aof->transaction_active) {
+        buffer = &aof->transaction; used = &aof->transaction_used; capacity = &aof->transaction_capacity;
+    } else {
+        buffer = &aof->pending; used = &aof->pending_used; capacity = &aof->pending_capacity;
+    }
+    if (record_length > SIZE_MAX - *used || reserve_bytes(buffer, capacity, *used + record_length) != 0) return -1;
+    if (encode_record(*buffer + *used, *capacity - *used, arguments, argument_count, record_length) != 0) return -1;
+    *used += record_length;
+    return 0;
+}
+
+int aof_transaction_begin(aof_t *aof)
+{
+    if (aof == NULL) return 0;
+    if (aof->transaction_active || !aof_can_accept_write(aof)) {
+        errno = aof->transaction_active ? EBUSY : EAGAIN; return -1;
+    }
+    aof->transaction_used = 0; aof->transaction_active = 1;
+    return 0;
+}
+
+int aof_transaction_commit(aof_t *aof, uint64_t *sequence)
+{
+    size_t position = 0;
+    uint64_t assigned = 0;
+
+    if (sequence != NULL) *sequence = 0;
+    if (aof == NULL) return 0;
+    if (!aof->transaction_active) { errno = EINVAL; return -1; }
+    pthread_mutex_lock(&aof->mutex);
+    if (aof->transaction_used > 0) assigned = ++aof->next_sequence;
+    while (position < aof->transaction_used) {
+        size_t available;
+        size_t amount;
+
+        if (aof->producer_chunk == NULL) {
+            aof->producer_chunk = acquire_chunk_locked(aof);
+            if (aof->producer_chunk == NULL) {
+                pthread_mutex_unlock(&aof->mutex);
+                aof->transaction_used = 0;
+                aof->transaction_active = 0;
+                return -1;
+            }
+            aof->producer_chunk->next = NULL;
+            aof->producer_chunk->length = 0;
+            aof->producer_chunk->offset = 0;
+            aof->producer_chunk->sequence = 0;
+            aof->producer_chunk->sequence_end = 0;
+        }
+        available = AOF_CHUNK_CAPACITY - aof->producer_chunk->length;
+        amount = aof->transaction_used - position;
+        if (amount > available) amount = available;
+        memcpy(aof->producer_chunk->data + aof->producer_chunk->length,
+               aof->transaction + position, amount);
+        aof->producer_chunk->length += amount;
+        position += amount;
+        aof->producer_chunk->sequence = assigned;
+        aof->producer_chunk->sequence_end = position == aof->transaction_used;
+        if (aof->producer_chunk->length == AOF_CHUNK_CAPACITY) {
+            queue_chunk_locked(aof, aof->producer_chunk);
+            aof->producer_chunk = NULL;
+        }
+    }
+    pthread_mutex_unlock(&aof->mutex);
+    aof->transaction_used = 0; aof->transaction_active = 0;
+    if (sequence != NULL) *sequence = assigned;
+    return 0;
+}
+
+void aof_transaction_rollback(aof_t *aof)
+{
+    if (aof != NULL) { aof->transaction_used = 0; aof->transaction_active = 0; }
+}
+
+int aof_can_accept_write(aof_t *aof)
+{
+    int result;
+    if (aof == NULL) return 1;
+    if (aof_last_error(aof) != 0) return 0;
+    pthread_mutex_lock(&aof->mutex);
+    result = !aof->backpressured && aof->async_error == 0;
+    pthread_mutex_unlock(&aof->mutex);
+    return result;
 }
 
 int aof_flush(aof_t *aof)
 {
-    if (aof == NULL) {
-        return 0;
+    uint64_t sequence = 0;
+    int error_number;
+    if (aof == NULL) return 0;
+    if (aof->transaction_active) { errno = EBUSY; return -1; }
+    pthread_mutex_lock(&aof->mutex);
+    if (aof->producer_chunk != NULL) {
+        queue_chunk_locked(aof, aof->producer_chunk);
+        aof->producer_chunk = NULL;
     }
-    if (check_async_failure(aof) != 0) {
-        return -1;
-    }
-    if (aof->buffer_used == 0) {
-        return 0;
-    }
-    if (write_all(aof, aof->buffer, aof->buffer_used) != 0) {
-        return -1;
-    }
-    aof->buffer_used = 0;
-    note_completed_write(aof);
-    return 0;
-}
-
-int aof_append(aof_t *aof,
-               const aof_argument_t *arguments,
-               size_t argument_count)
-{
-    size_t record_length;
-
-    if (aof == NULL || check_async_failure(aof) != 0) {
-        errno = aof != NULL && aof->last_error != 0 ? aof->last_error : EIO;
-        return -1;
-    }
-    if (encoded_size(arguments, argument_count, &record_length) != 0) {
-        remember_failure(aof, errno);
-        return -1;
-    }
-    if (record_length > aof->buffer_capacity) {
-        remember_failure(aof, EFBIG);
-        errno = EFBIG;
-        return -1;
-    }
-    if (record_length > aof->buffer_capacity - aof->buffer_used &&
-        aof_flush(aof) != 0) {
-        return -1;
-    }
-    if (encode_record(aof->buffer + aof->buffer_used,
-                      aof->buffer_capacity - aof->buffer_used,
-                      arguments,
-                      argument_count,
-                      record_length) != 0) {
-        remember_failure(aof, errno);
-        return -1;
-    }
-    aof->buffer_used += record_length;
-    if (aof->fsync_policy == AOF_FSYNC_ALWAYS) {
-        if (aof_flush(aof) != 0) {
-            return -1;
-        }
-        return sync_file_direct(aof);
-    }
-    if (aof->buffer_used >= AOF_FLUSH_THRESHOLD) {
-        return aof_flush(aof);
-    }
+    pthread_mutex_unlock(&aof->mutex);
+    if (aof->pending_used == 0) return 0;
+    if (enqueue_bytes(aof, aof->pending, aof->pending_used, &sequence) != 0) return -1;
+    aof->pending_used = 0;
+    pthread_mutex_lock(&aof->mutex);
+    while (aof->written_sequence < sequence && aof->async_error == 0)
+        pthread_cond_wait(&aof->condition, &aof->mutex);
+    error_number = aof->async_error;
+    pthread_mutex_unlock(&aof->mutex);
+    if (error_number != 0) { errno = error_number; return -1; }
     return 0;
 }
 
 int aof_maintain(aof_t *aof)
 {
-    uint64_t now;
-    uint64_t covered_generation;
-
-    if (aof == NULL) {
-        return 0;
-    }
-    if (aof_flush(aof) != 0) {
-        return -1;
-    }
-    if (aof->fsync_policy != AOF_FSYNC_EVERYSEC) {
-        return 0;
-    }
-    now = monotonic_now_ms();
-    if (now < aof->last_sync_request_ms ||
-        now - aof->last_sync_request_ms < 1000U) {
-        return 0;
-    }
-    pthread_mutex_lock(&aof->sync_mutex);
-    covered_generation = aof->synced_generation;
-    if (aof->syncing_generation > covered_generation) {
-        covered_generation = aof->syncing_generation;
-    }
-    if (aof->requested_generation > covered_generation) {
-        covered_generation = aof->requested_generation;
-    }
-    if (aof->write_generation > covered_generation) {
-        request_sync_locked(aof, aof->write_generation);
-    }
-    pthread_mutex_unlock(&aof->sync_mutex);
-    aof->last_sync_request_ms = now;
-    return check_async_failure(aof);
+    if (aof != NULL && aof_last_error(aof) != 0) { errno = aof_last_error(aof); return -1; }
+    return 0;
 }
 
-int aof_is_failed(aof_t *aof)
-{
-    return aof != NULL && check_async_failure(aof) != 0;
-}
-
+int aof_is_failed(aof_t *aof) { return aof != NULL && aof_last_error(aof) != 0; }
 int aof_last_error(aof_t *aof)
 {
-    int async_error;
+    int error_number;
 
-    if (aof == NULL) {
-        return 0;
-    }
-    if (aof->last_error != 0) {
-        return aof->last_error;
-    }
-    async_error = atomic_load_explicit(&aof->async_error,
-                                       memory_order_acquire);
-    return async_error;
+    if (aof == NULL) return 0;
+    pthread_mutex_lock(&aof->mutex);
+    error_number = aof->async_error;
+    pthread_mutex_unlock(&aof->mutex);
+    return error_number;
+}
+
+int aof_set_notify_fd(aof_t *aof, int notify_fd)
+{
+    if (aof == NULL || notify_fd < 0) { errno = EINVAL; return -1; }
+    aof->notify_fd = notify_fd; return 0;
+}
+
+int aof_sequence_ready(aof_t *aof, uint64_t sequence)
+{
+    int ready;
+
+    if (aof == NULL || sequence == 0) return 1;
+    pthread_mutex_lock(&aof->mutex);
+    ready = aof->written_sequence >= sequence;
+    pthread_mutex_unlock(&aof->mutex);
+    return ready;
+}
+
+void aof_get_info(aof_t *aof, aof_info_t *info)
+{
+    if (info == NULL) return;
+    memset(info, 0, sizeof(*info));
+    info->queue_high_water = AOF_QUEUE_HIGH_WATER; info->queue_low_water = AOF_QUEUE_LOW_WATER;
+    if (aof == NULL) return;
+    pthread_mutex_lock(&aof->mutex);
+    info->queue_bytes = aof->queue_bytes +
+                        (aof->producer_chunk == NULL ? 0 :
+                         aof->producer_chunk->length);
+    info->enqueued_sequence = aof->next_sequence;
+    info->written_sequence = aof->written_sequence;
+    info->synced_sequence = aof->synced_sequence;
+    info->written_bytes = aof->written_bytes;
+    info->backpressure_events = aof->backpressure_events;
+    info->backpressured = aof->backpressured;
+    info->last_error = aof->async_error; info->failed = info->last_error != 0;
+    pthread_mutex_unlock(&aof->mutex);
 }
 
 int aof_close(aof_t *aof)
 {
     int result = 0;
     int saved_errno = 0;
-    int can_sync;
-
-    if (aof == NULL) {
-        return 0;
-    }
-    can_sync = check_async_failure(aof) == 0;
-    if (can_sync && aof_flush(aof) != 0) {
-        result = -1;
-        saved_errno = aof->last_error;
-        can_sync = 0;
-    }
-    if (stop_sync_worker(aof,
-                         can_sync &&
-                         aof->fsync_policy == AOF_FSYNC_EVERYSEC) != 0) {
-        result = -1;
-        saved_errno = errno;
-    }
-    if (check_async_failure(aof) != 0 && result == 0) {
-        result = -1;
-        saved_errno = aof->last_error;
-    }
-    if (close(aof->fd) != 0 && result == 0) {
-        result = -1;
-        saved_errno = errno;
-    }
-    pthread_cond_destroy(&aof->sync_condition);
-    pthread_mutex_destroy(&aof->sync_mutex);
-    free(aof->buffer);
-    free(aof);
-    if (result != 0) {
-        errno = saved_errno == 0 ? EIO : saved_errno;
-    }
+    aof_chunk_t *chunk;
+    if (aof == NULL) return 0;
+    if (aof->transaction_active) aof_transaction_rollback(aof);
+    if (aof_flush(aof) != 0) { result = -1; saved_errno = errno; }
+    pthread_mutex_lock(&aof->mutex); aof->stopping = 1; pthread_cond_broadcast(&aof->condition); pthread_mutex_unlock(&aof->mutex);
+    if (aof->writer_started && pthread_join(aof->writer_thread, NULL) != 0 && result == 0) { result = -1; saved_errno = EIO; }
+    if (aof_last_error(aof) != 0 && result == 0) { result = -1; saved_errno = aof_last_error(aof); }
+    while ((chunk = aof->queue_head) != NULL) { aof->queue_head = chunk->next; free(chunk); }
+    free(aof->producer_chunk);
+    while ((chunk = aof->free_chunks) != NULL) { aof->free_chunks = chunk->next; free(chunk); }
+    if (close(aof->fd) != 0 && result == 0) { result = -1; saved_errno = errno; }
+    pthread_cond_destroy(&aof->condition); pthread_mutex_destroy(&aof->mutex);
+    free(aof->pending); free(aof->transaction); free(aof);
+    if (result != 0) errno = saved_errno == 0 ? EIO : saved_errno;
     return result;
 }

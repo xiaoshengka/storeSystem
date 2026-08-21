@@ -129,6 +129,43 @@ int main(void)
     assert(aof_close(aof) == 0);
     assert(stat(path, &after) == 0 && after.st_size > 0);
 
+    fd = open(path, O_WRONLY | O_TRUNC);
+    assert(fd >= 0);
+    assert(close(fd) == 0);
+    assert(aof_open(&aof, path, AOF_FSYNC_NO) == 0);
+    {
+        uint64_t sequence = 0;
+        aof_info_t info;
+        struct timespec delay = {0, 1000000L};
+        int attempts;
+
+        assert(aof_transaction_begin(aof) == 0);
+        assert(aof_append(aof, set_arguments, 3U) == 0);
+        assert(aof_append(aof, del_arguments, 2U) == 0);
+        assert(aof_transaction_commit(aof, &sequence) == 0);
+        assert(sequence > 0);
+        assert(aof_flush(aof) == 0);
+        for (attempts = 0; attempts < 2000 &&
+             !aof_sequence_ready(aof, sequence); ++attempts) {
+            assert(nanosleep(&delay, NULL) == 0);
+        }
+        assert(aof_sequence_ready(aof, sequence));
+        aof_get_info(aof, &info);
+        assert(info.enqueued_sequence == sequence);
+        assert(info.written_sequence >= sequence);
+        assert(info.written_bytes > 0);
+        assert(aof_transaction_begin(aof) == 0);
+        assert(aof_append(aof, set_arguments, 3U) == 0);
+        aof_transaction_rollback(aof);
+    }
+    assert(aof_close(aof) == 0);
+    capture.count = 0;
+    assert(aof_open(&aof, path, AOF_FSYNC_NO) == 0);
+    assert(aof_replay(aof, capture_command, &capture, &stats) == 0);
+    assert(capture.count == 2U);
+    assert(stats.commands_loaded == 2U);
+    assert(aof_close(aof) == 0);
+
     assert(unlink(path) == 0);
     puts("test_aof: PASS");
     return 0;

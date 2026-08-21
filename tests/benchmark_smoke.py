@@ -3,6 +3,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +53,7 @@ def test_collection_compare_matrix() -> None:
         ("off", "no", "everysec"),
         module.ALL_WORKLOADS,
         5,
+        (16,),
     )
     assert len(cases) == 190
     hash_cases = [case for case in cases if case[3] in module.HASH_WORKLOADS]
@@ -59,6 +61,16 @@ def test_collection_compare_matrix() -> None:
     assert local_hash_cases
     assert {case[0] for case in local_hash_cases} == {"hash"}
     assert all(case[1] == "skiplist" for case in local_hash_cases)
+
+    string_cases = module.build_cases(
+        ("skiplist", "redis"),
+        ("off", "everysec"),
+        ("string-mixed",),
+        2,
+        (16,),
+    )
+    assert len(string_cases) == 8
+    assert {case[0] for case in string_cases} == {"string", "redis"}
 
     redis_command = module.server_command(
         "redis",
@@ -69,6 +81,35 @@ def test_collection_compare_matrix() -> None:
     )
     rewrite_option = redis_command.index("--auto-aof-rewrite-percentage")
     assert redis_command[rewrite_option + 1] == "0"
+
+
+def test_string_mixed_compare_script() -> None:
+    with tempfile.TemporaryDirectory(prefix="string-mixed-compare-") as directory:
+        csv_path = Path(directory) / "result.csv"
+        subprocess.run(
+            [
+                sys.executable,
+                "bench/redis_collection_compare.py",
+                "--targets", "skiplist",
+                "--workloads", "string-mixed",
+                "--aof-policies", "off",
+                "--repeats", "1",
+                "--connections", "2",
+                "--requests", "1000",
+                "--warmup", "10",
+                "--pipelines", "4",
+                "--keyspace", "100",
+                "--csv", str(csv_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60.0,
+        )
+        rows = csv_path.read_text().splitlines()
+        assert len(rows) == 2
+        assert "string-mixed" in rows[1]
+        assert ",100," in rows[1]
 
 
 def test_latency_metrics() -> None:
@@ -152,6 +193,8 @@ def test_collection_metrics() -> None:
             metrics = parse_metrics(result.stdout)
             assert metrics["keyspace_scope"] == "shared"
             assert metrics["dataset_key"] == "collection:zset:20260820"
+            assert metrics["payload_kind"] == "zset-member"
+            assert metrics["payload_bytes"] == "64"
             assert exchange(b"ZCARD", metrics["dataset_key"].encode()) == (
                 "integer", 100
             )
@@ -211,23 +254,27 @@ def test_collection_metrics() -> None:
 
 
 def test_replay_benchmark() -> None:
-    result = subprocess.run(
-        [
-            sys.executable,
-            "bench/aof_replay_bench.py",
-            "--sizes", "100",
-            "--repeats", "2",
-            "--value-size", "8",
-            "--timeout", "10",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30.0,
-    )
-    assert "summary commands=100" in result.stdout
-    assert "replay_p50=" in result.stdout
-    assert "rate=" in result.stdout
+    with tempfile.TemporaryDirectory(prefix="replay-smoke-") as directory:
+        csv_path = Path(directory) / "raw.csv"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "bench/aof_replay_bench.py",
+                "--targets", "project-skiplist",
+                "--workloads", "string",
+                "--sizes", "100",
+                "--repeats", "1",
+                "--timeout", "10",
+                "--csv", str(csv_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+        assert "target=project-skiplist" in result.stdout
+        assert csv_path.is_file()
+        assert csv_path.with_suffix(".csv.summary.csv").is_file()
 
 
 def test_latency_benchmark_script() -> None:
@@ -258,6 +305,7 @@ def test_latency_benchmark_script() -> None:
 
 def main() -> int:
     test_collection_compare_matrix()
+    test_string_mixed_compare_script()
     test_latency_metrics()
     test_collection_metrics()
     test_replay_benchmark()

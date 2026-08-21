@@ -63,6 +63,11 @@ int kvstore_service_execute(kvstore_service_t *service,
                             const kvstore_argument_t *arguments,
                             size_t argument_count,
                             kvstore_reply_t *reply);
+int kvstore_service_execute_with_barrier(kvstore_service_t *service,
+                                         const kvstore_argument_t *arguments,
+                                         size_t argument_count,
+                                         kvstore_reply_t *reply,
+                                         uint64_t *response_barrier);
 
 int kvstore_engine_init(void);
 void kvstore_engine_destroy(void);

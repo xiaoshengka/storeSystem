@@ -18,6 +18,7 @@
 
 #define COMMAND_CAPACITY 512U
 #define LINE_CAPACITY 128U
+#define PAYLOAD_SIZE 64U
 
 typedef enum workload {
     WORKLOAD_HASH_INSERT,
@@ -366,6 +367,7 @@ static int format_command(char *output, size_t capacity, const char *key,
 {
     const char *command;
     char field[48];
+    char member[PAYLOAD_SIZE + 1U];
     char score[48];
     static const char base_value[] =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -390,6 +392,10 @@ static int format_command(char *output, size_t capacity, const char *key,
         value[16] = measured ? 't' : 'w';
     }
     snprintf(field, sizeof(field), "item-%" PRIu64, field_index);
+    written = snprintf(member, sizeof(member), "item-%" PRIu64, field_index);
+    if (written < 0 || (size_t)written > PAYLOAD_SIZE) return -1;
+    memset(member + written, 'x', PAYLOAD_SIZE - (size_t)written);
+    member[PAYLOAD_SIZE] = '\0';
     snprintf(score, sizeof(score), "%" PRIu64 ".%u",
              field_index, (unsigned int)(sequence % 10U));
     if (workload == WORKLOAD_ZRANGE) {
@@ -409,14 +415,15 @@ static int format_command(char *output, size_t capacity, const char *key,
                            "*4\r\n$4\r\nZADD\r\n$%zu\r\n%s\r\n"
                            "$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                            strlen(key), key, strlen(score), score,
-                           strlen(field), field);
+                           strlen(member), member);
     } else {
         command = workload == WORKLOAD_HGET ? "HGET" : "ZSCORE";
         *expected = REPLY_BULK_NONNULL;
         written = snprintf(output, capacity,
                            "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                            strlen(command), command, strlen(key), key,
-                           strlen(field), field);
+                           strlen(workload == WORKLOAD_HGET ? field : member),
+                           workload == WORKLOAD_HGET ? field : member);
     }
     return written < 0 || (size_t)written >= capacity ? -1 : written;
 }
@@ -670,6 +677,9 @@ stop:
                workload_is_insert(options.workload)
                    ? options.requests
                    : options.keyspace);
+        printf("payload_kind: %s\npayload_bytes: %u\n",
+               workload_is_hash(options.workload) ? "hash-value" : "zset-member",
+               PAYLOAD_SIZE);
         printf("elapsed_seconds: %.6f\nqps: %.2f\n", seconds, completed / seconds);
         printf("latency_mean_us: %.3Lf\n", sum / completed / 1000.0L);
         printf("latency_p50_us: %.3f\nlatency_p95_us: %.3f\n",

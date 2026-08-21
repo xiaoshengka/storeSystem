@@ -8,6 +8,26 @@ DEPFLAGS ?= -MMD -MP
 LDFLAGS ?=
 LDLIBS ?=
 
+ifneq ($(filter clean asan valgrind valgrind-run helgrind,$(MAKECMDGOALS)),)
+ALLOCATOR ?= libc
+else
+ALLOCATOR ?= jemalloc
+endif
+
+ifeq ($(ALLOCATOR),jemalloc)
+JEMALLOC_CFLAGS := $(shell pkg-config --cflags jemalloc 2>/dev/null)
+JEMALLOC_LIBS := $(shell pkg-config --libs jemalloc 2>/dev/null)
+ifeq ($(strip $(JEMALLOC_LIBS)),)
+$(error jemalloc is required for the default build; install libjemalloc-dev or use ALLOCATOR=libc for diagnostics)
+endif
+CPPFLAGS += $(JEMALLOC_CFLAGS) -DKVSTORE_ALLOCATOR_JEMALLOC
+LDLIBS += $(JEMALLOC_LIBS)
+else ifeq ($(ALLOCATOR),libc)
+CPPFLAGS += -DKVSTORE_ALLOCATOR_LIBC
+else
+$(error Unsupported ALLOCATOR '$(ALLOCATOR)'; use jemalloc or libc)
+endif
+
 LEGACY_ENGINE_SRCS := \
 	src/kvstore_array.c \
 	src/kvstore_rbtree.c \
@@ -70,7 +90,7 @@ ALL_OBJS := $(SERVER_OBJS) $(BUFFER_TEST_OBJS) $(KV_TEST_OBJS) \
 	$(OBJECT_TEST_OBJS) $(RESP_SERVICE_TEST_OBJS) $(AOF_TEST_OBJS) $(LEGACY_CLIENT_OBJ) \
 	$(QPS_CLIENT_OBJ) $(MIXED_QPS_CLIENT_OBJ) $(COLLECTION_BENCH_CLIENT_OBJ)
 
-.PHONY: all clean test integration-test benchmark-test asan valgrind valgrind-run ntyco
+.PHONY: all clean test integration-test benchmark-test asan valgrind valgrind-run helgrind ntyco
 
 all: $(SERVER_TARGET) legacy_client qps_client mixed_qps_client collection_bench_client
 
@@ -138,20 +158,20 @@ benchmark-test: kvstore mixed_qps_client collection_bench_client
 	python3 tests/benchmark_smoke.py
 
 asan:
-	$(MAKE) clean
-	$(MAKE) BUILD_DIR=build/asan \
+	$(MAKE) ALLOCATOR=libc clean
+	$(MAKE) ALLOCATOR=libc BUILD_DIR=build/asan \
 		CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 		LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" test
-	$(MAKE) BUILD_DIR=build/asan \
+	$(MAKE) ALLOCATOR=libc BUILD_DIR=build/asan \
 		CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 		LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" integration-test
-	$(MAKE) BUILD_DIR=build/asan \
+	$(MAKE) ALLOCATOR=libc BUILD_DIR=build/asan \
 		CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 		LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" benchmark-test
 
 valgrind:
-	$(MAKE) clean
-	$(MAKE) valgrind-run
+	$(MAKE) ALLOCATOR=libc clean
+	$(MAKE) ALLOCATOR=libc valgrind-run
 
 valgrind-run: test_buffer test_kvstore test_resp test_hash test_object test_cache test_resp_service test_aof kvstore
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_buffer
@@ -168,6 +188,13 @@ valgrind-run: test_buffer test_kvstore test_resp test_hash test_object test_cach
 		KVSTORE_SHOW_SERVER_LOGS=1 python3 tests/cache_integration.py
 	KVSTORE_AOF_SERVER_PREFIX="valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1" \
 		KVSTORE_SHOW_SERVER_LOGS=1 python3 tests/aof_integration.py
+
+helgrind:
+	$(MAKE) ALLOCATOR=libc clean
+	$(MAKE) ALLOCATOR=libc test_aof kvstore
+	valgrind --tool=helgrind --error-exitcode=1 ./test_aof
+	KVSTORE_AOF_SERVER_PREFIX="valgrind --tool=helgrind --error-exitcode=1" \
+		python3 tests/aof_integration.py
 
 ntyco:
 	@test -f NtyCo/Makefile || { \
