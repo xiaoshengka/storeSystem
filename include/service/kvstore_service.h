@@ -6,6 +6,7 @@
 
 #include "cache/cache.h"
 #include "persistence/aof.h"
+#include "storage/mysql_store.h"
 
 typedef struct kvstore_persistence_info {
     int rdb_enabled;
@@ -42,6 +43,16 @@ typedef struct kvstore_service {
     kvstore_persistence_admin_t persistence_admin;
     void *persistence_context;
     uint64_t dirty_changes;
+    mysql_store_t *mysql_store;
+    unsigned char mysql_writer_uuid[16];
+    uint64_t mysql_next_sequence;
+    uint64_t mysql_candidate_sequence;
+    int mysql_recording_command;
+    mysql_store_argument_t mysql_mutation_arguments[128];
+    size_t mysql_mutation_count;
+    unsigned char *mysql_mutation_buffer;
+    size_t mysql_mutation_buffer_capacity;
+    size_t mysql_mutation_buffer_used;
 } kvstore_service_t;
 
 typedef struct kvstore_argument {
@@ -80,6 +91,10 @@ void kvstore_service_destroy(kvstore_service_t *service);
 int kvstore_service_maintain(kvstore_service_t *service);
 int kvstore_service_flush(kvstore_service_t *service);
 void kvstore_service_attach_aof(kvstore_service_t *service, aof_t *aof);
+void kvstore_service_attach_mysql(kvstore_service_t *service,
+                                  mysql_store_t *store,
+                                  const unsigned char writer_uuid[16],
+                                  uint64_t next_sequence);
 void kvstore_service_set_persistence_admin(
     kvstore_service_t *service,
     const kvstore_persistence_admin_t *admin,

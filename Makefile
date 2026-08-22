@@ -7,6 +7,22 @@ CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic
 DEPFLAGS ?= -MMD -MP
 LDFLAGS ?=
 LDLIBS ?=
+MYSQL ?= 0
+MYSQL_COLD_MISS_ARGS ?=
+
+ifeq ($(MYSQL),1)
+MYSQL_CFLAGS := $(shell pkg-config --cflags mysqlclient 2>/dev/null)
+MYSQL_LIBS := $(shell pkg-config --libs mysqlclient 2>/dev/null)
+ifeq ($(strip $(MYSQL_LIBS)),)
+MYSQL_CFLAGS := $(shell mysql_config --cflags 2>/dev/null)
+MYSQL_LIBS := $(shell mysql_config --libs 2>/dev/null)
+endif
+ifeq ($(strip $(MYSQL_LIBS)),)
+$(error MySQL client development files are required for MYSQL=1)
+endif
+CPPFLAGS += $(MYSQL_CFLAGS) -DKVSTORE_WITH_MYSQL
+LDLIBS += $(MYSQL_LIBS)
+endif
 
 ifneq ($(filter clean asan valgrind valgrind-run helgrind,$(MAKECMDGOALS)),)
 ALLOCATOR ?= libc
@@ -42,6 +58,7 @@ LEGACY_SERVICE_SRCS := src/kvstore.c
 RESP_SERVICE_SRCS := src/service/kvstore_resp_service.c
 PROTOCOL_SRCS := src/protocol/resp.c
 APP_SRCS := src/app/main.c
+STORAGE_SRCS := src/storage/mysql_store.c
 
 ifeq ($(NETWORK_BACKEND),ntyco)
 CPPFLAGS += -DNETWORK_BACKEND_NTYCO -INtyCo/include -INtyCo/core
@@ -56,7 +73,7 @@ else ifeq ($(NETWORK_BACKEND),epoll)
 CPPFLAGS += -pthread
 LDLIBS += -pthread
 NET_SRCS := src/net/buffer.c src/net/reactor.c
-SERVER_SERVICE_SRCS := $(RESP_SERVICE_SRCS) $(CACHE_SRCS) $(PERSISTENCE_SRCS)
+SERVER_SERVICE_SRCS := $(RESP_SERVICE_SRCS) $(CACHE_SRCS) $(PERSISTENCE_SRCS) $(STORAGE_SRCS)
 SERVER_PROTOCOL_SRCS := $(PROTOCOL_SRCS)
 SERVER_ENGINE_SRCS := $(HASH_ENGINE_SRCS) $(OBJECT_ENGINE_SRCS)
 SERVER_TARGET := kvstore
@@ -79,12 +96,14 @@ OBJECT_TEST_SRCS := tests/test_object.c $(OBJECT_ENGINE_SRCS) $(HASH_ENGINE_SRCS
 OBJECT_TEST_OBJS := $(OBJECT_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
 CACHE_TEST_SRCS := tests/test_cache.c $(CACHE_SRCS) $(OBJECT_ENGINE_SRCS) $(HASH_ENGINE_SRCS)
 CACHE_TEST_OBJS := $(CACHE_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
-RESP_SERVICE_TEST_SRCS := tests/test_resp_service.c $(RESP_SERVICE_SRCS) $(CACHE_SRCS) $(PERSISTENCE_SRCS) $(PROTOCOL_SRCS) $(OBJECT_ENGINE_SRCS) $(HASH_ENGINE_SRCS)
+RESP_SERVICE_TEST_SRCS := tests/test_resp_service.c $(RESP_SERVICE_SRCS) $(CACHE_SRCS) $(PERSISTENCE_SRCS) $(STORAGE_SRCS) $(PROTOCOL_SRCS) $(OBJECT_ENGINE_SRCS) $(HASH_ENGINE_SRCS)
 RESP_SERVICE_TEST_OBJS := $(RESP_SERVICE_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
 AOF_TEST_SRCS := tests/test_aof.c $(AOF_SRCS) $(PROTOCOL_SRCS)
 AOF_TEST_OBJS := $(AOF_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
 RDB_TEST_SRCS := tests/test_rdb.c $(RDB_SRCS) $(CACHE_SRCS) $(OBJECT_ENGINE_SRCS) $(HASH_ENGINE_SRCS)
 RDB_TEST_OBJS := $(RDB_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
+REACTOR_ASYNC_TEST_SRCS := tests/test_reactor_async.c src/net/reactor.c src/net/buffer.c
+REACTOR_ASYNC_TEST_OBJS := $(REACTOR_ASYNC_TEST_SRCS:%.c=$(BUILD_DIR)/%.o)
 LEGACY_CLIENT_OBJ := $(BUILD_DIR)/bench/legacy_client.o
 QPS_CLIENT_OBJ := $(BUILD_DIR)/bench/qps_client.o
 MIXED_QPS_CLIENT_OBJ := $(BUILD_DIR)/bench/mixed_qps_client.o
@@ -92,9 +111,10 @@ COLLECTION_BENCH_CLIENT_OBJ := $(BUILD_DIR)/bench/collection_bench_client.o
 ALL_OBJS := $(SERVER_OBJS) $(BUFFER_TEST_OBJS) $(KV_TEST_OBJS) \
 	$(RESP_TEST_OBJS) $(HASH_TEST_OBJS) $(CACHE_TEST_OBJS) \
 	$(OBJECT_TEST_OBJS) $(RESP_SERVICE_TEST_OBJS) $(AOF_TEST_OBJS) $(RDB_TEST_OBJS) $(LEGACY_CLIENT_OBJ) \
+	$(REACTOR_ASYNC_TEST_OBJS) \
 	$(QPS_CLIENT_OBJ) $(MIXED_QPS_CLIENT_OBJ) $(COLLECTION_BENCH_CLIENT_OBJ)
 
-.PHONY: all clean test integration-test benchmark-test asan valgrind valgrind-run helgrind ntyco
+.PHONY: all clean test integration-test mysql-integration-test mysql-cold-miss-bench benchmark-test asan valgrind valgrind-run helgrind ntyco
 
 all: $(SERVER_TARGET) legacy_client qps_client mixed_qps_client collection_bench_client
 
@@ -146,7 +166,10 @@ test_aof: $(AOF_TEST_OBJS)
 test_rdb: $(RDB_TEST_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-test: test_buffer test_kvstore test_resp test_hash test_object test_cache test_resp_service test_aof test_rdb
+test_reactor_async: $(REACTOR_ASYNC_TEST_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+test: test_buffer test_kvstore test_resp test_hash test_object test_cache test_resp_service test_aof test_rdb test_reactor_async
 	./test_buffer
 	./test_kvstore
 	./test_resp
@@ -156,12 +179,21 @@ test: test_buffer test_kvstore test_resp test_hash test_object test_cache test_r
 	./test_resp_service
 	./test_aof
 	./test_rdb
+	./test_reactor_async
 
 integration-test: kvstore
 	KVSTORE_SERVER_COMMAND="./kvstore --maxmemory 4MiB --maxkeys 4096" python3 tests/reactor_integration.py
 	KVSTORE_CACHE_SERVER_COMMAND="./kvstore --maxmemory 1MiB --maxkeys 2" python3 tests/cache_integration.py
 	python3 tests/aof_integration.py
 	python3 tests/rdb_integration.py
+
+mysql-integration-test:
+	$(MAKE) MYSQL=1 kvstore
+	python3 tests/mysql_integration.py
+
+mysql-cold-miss-bench:
+	$(MAKE) MYSQL=1 kvstore mixed_qps_client
+	python3 bench/mysql_cold_miss_bench.py $(MYSQL_COLD_MISS_ARGS)
 
 benchmark-test: kvstore mixed_qps_client collection_bench_client
 	python3 tests/benchmark_smoke.py
@@ -182,7 +214,7 @@ valgrind:
 	$(MAKE) ALLOCATOR=libc clean
 	$(MAKE) ALLOCATOR=libc valgrind-run
 
-valgrind-run: test_buffer test_kvstore test_resp test_hash test_object test_cache test_resp_service test_aof test_rdb kvstore
+valgrind-run: test_buffer test_kvstore test_resp test_hash test_object test_cache test_resp_service test_aof test_rdb test_reactor_async kvstore
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_buffer
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_kvstore
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_resp
@@ -192,6 +224,7 @@ valgrind-run: test_buffer test_kvstore test_resp test_hash test_object test_cach
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_resp_service
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_aof
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_rdb
+	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./test_reactor_async
 	KVSTORE_SERVER_COMMAND="valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./kvstore --maxmemory 4MiB --maxkeys 4096" \
 		KVSTORE_SHOW_SERVER_LOGS=1 python3 tests/reactor_integration.py
 	KVSTORE_CACHE_SERVER_COMMAND="valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./kvstore --maxmemory 1MiB --maxkeys 2" \
@@ -204,8 +237,9 @@ valgrind-run: test_buffer test_kvstore test_resp test_hash test_object test_cach
 helgrind:
 	$(MAKE) ALLOCATOR=libc clean
 	$(MAKE) ALLOCATOR=libc CPPFLAGS="$(CPPFLAGS) -DKVSTORE_HELGRIND" \
-		test_aof kvstore
+		test_aof test_reactor_async kvstore
 	valgrind --tool=helgrind --error-exitcode=1 ./test_aof
+	valgrind --tool=helgrind --error-exitcode=1 ./test_reactor_async
 	KVSTORE_AOF_SERVER_PREFIX="valgrind --tool=helgrind --error-exitcode=1" \
 		python3 tests/aof_integration.py
 	KVSTORE_RDB_SERVER_PREFIX="valgrind --tool=helgrind --error-exitcode=1" \
@@ -226,4 +260,4 @@ $(BUILD_DIR)/%.o: %.c
 -include $(ALL_OBJS:.o=.d)
 
 clean:
-	rm -rf build kvstore kvstore-ntyco legacy_client qps_client mixed_qps_client collection_bench_client test_buffer test_kvstore test_resp test_hash test_object test_cache test_resp_service test_aof test_rdb
+	rm -rf build kvstore kvstore-ntyco legacy_client qps_client mixed_qps_client collection_bench_client test_buffer test_kvstore test_resp test_hash test_object test_cache test_resp_service test_aof test_rdb test_reactor_async
