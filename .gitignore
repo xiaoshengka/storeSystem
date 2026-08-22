@@ -18,6 +18,7 @@ test_cache
 test_resp_service
 test_aof
 test_rdb
+test_reactor_async
 *.o
 *.a
 

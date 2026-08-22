@@ -42,6 +42,8 @@ struct reactor_connection {
     uint32_t events;
     int peer_eof;
     int close_after_write;
+    int async_pending;
+    uint64_t connection_id;
     uint64_t response_barrier;
     net_buffer_t input;
     net_buffer_t output;
@@ -64,7 +66,10 @@ struct reactor {
     void *flush_context;
     reactor_barrier_ready_handler barrier_handler;
     void *barrier_context;
+    reactor_async_handler async_handler;
+    void *async_context;
     reactor_connection_t *clients;
+    uint64_t next_connection_id;
 };
 
 static int set_nonblocking(int fd)
@@ -194,6 +199,9 @@ static reactor_connection_t *client_create(reactor_t *reactor, int fd)
     if (connection == NULL) {
         return NULL;
     }
+    reactor->next_connection_id++;
+    if (reactor->next_connection_id == 0) reactor->next_connection_id++;
+    connection->connection_id = reactor->next_connection_id;
     if (net_buffer_init(&connection->input, REACTOR_INITIAL_BUFFER) != 0 ||
         net_buffer_init(&connection->output, REACTOR_INITIAL_BUFFER) != 0) {
         net_buffer_destroy(&connection->input);
@@ -292,6 +300,7 @@ static int refresh_client_events(reactor_connection_t *connection)
         events |= EPOLLOUT;
     }
     if (!connection->peer_eof && !connection->close_after_write &&
+        !connection->async_pending &&
         net_buffer_readable(&connection->output) < REACTOR_OUTPUT_HIGH_WATER) {
         events |= EPOLLIN;
     }
@@ -302,7 +311,7 @@ static int process_input(reactor_connection_t *connection)
 {
     while (net_buffer_readable(&connection->input) > 0 &&
            net_buffer_readable(&connection->output) < REACTOR_OUTPUT_HIGH_WATER &&
-           !connection->close_after_write) {
+           !connection->close_after_write && !connection->async_pending) {
         size_t available = net_buffer_readable(&connection->input);
         size_t consumed = 0;
         size_t output_before = connection->output.write_pos;
@@ -316,6 +325,7 @@ static int process_input(reactor_connection_t *connection)
             &consumed,
             &close_after_response,
             &response_barrier,
+            (reactor_request_token_t){connection->connection_id},
             connection->owner->handler_context);
 
         if (result == REACTOR_HANDLER_INCOMPLETE) {
@@ -325,7 +335,8 @@ static int process_input(reactor_connection_t *connection)
             }
             break;
         }
-        if (result != REACTOR_HANDLER_COMPLETE || consumed == 0 ||
+        if ((result != REACTOR_HANDLER_COMPLETE &&
+             result != REACTOR_HANDLER_DEFERRED) || consumed == 0 ||
             consumed > available ||
             connection->output.write_pos < output_before ||
             connection->output.write_pos - output_before > REACTOR_MAX_RESPONSE) {
@@ -333,6 +344,15 @@ static int process_input(reactor_connection_t *connection)
             return -1;
         }
         net_buffer_consume(&connection->input, consumed);
+        if (result == REACTOR_HANDLER_DEFERRED) {
+            if (connection->output.write_pos != output_before ||
+                close_after_response || response_barrier != 0) {
+                errno = EPROTO;
+                return -1;
+            }
+            connection->async_pending = 1;
+            break;
+        }
         if (response_barrier > connection->response_barrier) {
             connection->response_barrier = response_barrier;
         }
@@ -350,7 +370,7 @@ static int handle_read(reactor_connection_t *connection)
         void *destination;
         size_t capacity;
 
-        if (connection->close_after_write ||
+        if (connection->close_after_write || connection->async_pending ||
             net_buffer_readable(&connection->output) >= REACTOR_OUTPUT_HIGH_WATER) {
             break;
         }
@@ -411,12 +431,16 @@ static int handle_write(reactor_connection_t *connection)
     return refresh_client_events(connection);
 }
 
-static void drain_wake_fd(reactor_t *reactor)
+static int drain_wake_fd(reactor_t *reactor)
 {
     uint64_t value;
     reactor_connection_t *connection;
 
     while (read(reactor->wake_source->fd, &value, sizeof(value)) < 0 && errno == EINTR) {
+    }
+    if (reactor->async_handler != NULL &&
+        reactor->async_handler(reactor->async_context) != 0) {
+        return -1;
     }
     connection = reactor->clients;
     while (connection != NULL) {
@@ -427,6 +451,7 @@ static void drain_wake_fd(reactor_t *reactor)
         }
         connection = next;
     }
+    return 0;
 }
 
 static int drain_timer_fd(reactor_t *reactor)
@@ -537,7 +562,10 @@ int reactor_run(reactor_t *reactor)
                 continue;
             }
             if (source->kind == REACTOR_SOURCE_WAKE) {
-                drain_wake_fd(reactor);
+                if ((active & (EPOLLERR | EPOLLHUP)) != 0 ||
+                    drain_wake_fd(reactor) != 0) {
+                    return -1;
+                }
                 continue;
             }
             if (source->kind == REACTOR_SOURCE_TIMER) {
@@ -620,6 +648,62 @@ int reactor_set_response_barrier(reactor_t *reactor,
     reactor->barrier_handler = handler;
     reactor->barrier_context = handler_context;
     return 0;
+}
+
+int reactor_set_async_handler(reactor_t *reactor,
+                              reactor_async_handler handler,
+                              void *handler_context)
+{
+    if (reactor == NULL || handler == NULL || reactor->async_handler != NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    reactor->async_handler = handler;
+    reactor->async_context = handler_context;
+    return 0;
+}
+
+int reactor_complete_response(reactor_t *reactor,
+                              reactor_request_token_t request_token,
+                              const void *response,
+                              size_t response_length,
+                              int close_after_response,
+                              uint64_t response_barrier)
+{
+    reactor_connection_t *connection;
+
+    if (reactor == NULL || request_token.connection_id == 0 ||
+        (response == NULL && response_length != 0) ||
+        response_length > REACTOR_MAX_RESPONSE) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (connection = reactor->clients;
+         connection != NULL;
+         connection = connection->next) {
+        if (connection->connection_id == request_token.connection_id) break;
+    }
+    if (connection == NULL) return 0;
+    if (!connection->async_pending) {
+        errno = EALREADY;
+        return -1;
+    }
+    if (net_buffer_append(&connection->output, response, response_length) != 0) {
+        connection_destroy(connection);
+        return -1;
+    }
+    connection->async_pending = 0;
+    if (response_barrier > connection->response_barrier) {
+        connection->response_barrier = response_barrier;
+    }
+    if (close_after_response) {
+        connection->close_after_write = 1;
+        net_buffer_reset(&connection->input);
+    } else if (process_input(connection) != 0) {
+        connection_destroy(connection);
+        return -1;
+    }
+    return 1;
 }
 
 int reactor_wake_fd(reactor_t *reactor)

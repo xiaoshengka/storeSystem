@@ -2,10 +2,10 @@
   "passed": false,
   "zset_winner": "skiplist",
   "zset_geomean_qps": {
-    "skiplist": 1005158.8287104556,
-    "rbtree": 999316.6042622806
+    "skiplist": 1077643.0628929462,
+    "rbtree": 1074633.713668679
   },
-  "zset_relative_difference": 0.005812240097090008,
+  "zset_relative_difference": 0.0027925287397003785,
   "checks": [
     {
       "workload": "string-mixed",
@@ -13,10 +13,10 @@
       "policy": "off",
       "scenario": "normal",
       "passed": true,
-      "project_qps": 803838.45,
-      "redis_qps": 737308.15,
-      "project_p99_us": 965.139,
-      "redis_p99_us": 1308.138
+      "project_qps": 808489.75,
+      "redis_qps": 747081.47,
+      "project_p99_us": 959.395,
+      "redis_p99_us": 1274.877
     },
     {
       "workload": "string-mixed",
@@ -24,10 +24,10 @@
       "policy": "everysec",
       "scenario": "normal",
       "passed": true,
-      "project_qps": 745724.37,
-      "redis_qps": 697389.28,
-      "project_p99_us": 846.701,
-      "redis_p99_us": 1376.849
+      "project_qps": 752673.16,
+      "redis_qps": 711209.33,
+      "project_p99_us": 870.709,
+      "redis_p99_us": 1324.815
     },
     {
       "workload": "string-mixed",
@@ -35,10 +35,10 @@
       "policy": "everysec",
       "scenario": "bgsave",
       "passed": true,
-      "project_qps": 750896.47,
-      "redis_qps": 693494.62,
-      "project_p99_us": 852.426,
-      "redis_p99_us": 1380.851
+      "project_qps": 758728.73,
+      "redis_qps": 710062.89,
+      "project_p99_us": 862.238,
+      "redis_p99_us": 1342.939
     },
     {
       "workload": "string-mixed",
@@ -46,10 +46,10 @@
       "policy": "off",
       "scenario": "normal",
       "passed": true,
-      "project_qps": 1869993.88,
-      "redis_qps": 1503828.65,
-      "project_p99_us": 1680.544,
-      "redis_p99_us": 2474.326
+      "project_qps": 1888875.23,
+      "redis_qps": 1543315.86,
+      "project_p99_us": 1642.305,
+      "redis_p99_us": 2402.896
     },
     {
       "workload": "string-mixed",
@@ -57,10 +57,10 @@
       "policy": "everysec",
       "scenario": "normal",
       "passed": true,
-      "project_qps": 1767973.42,
-      "redis_qps": 1405998.36,
-      "project_p99_us": 1441.808,
-      "redis_p99_us": 2661.122
+      "project_qps": 1770578.1,
+      "redis_qps": 1437694.55,
+      "project_p99_us": 1499.637,
+      "redis_p99_us": 2619.285
     },
     {
       "workload": "string-mixed",
@@ -68,10 +68,10 @@
       "policy": "everysec",
       "scenario": "bgsave",
       "passed": true,
-      "project_qps": 1738315.3,
-      "redis_qps": 1392233.68,
-      "project_p99_us": 1578.562,
-      "redis_p99_us": 2698.121
+      "project_qps": 1751162.49,
+      "redis_qps": 1420981.01,
+      "project_p99_us": 1666.146,
+      "redis_p99_us": 2631.675
     },
     {
       "workload": "hash-mixed",
@@ -79,10 +79,10 @@
       "policy": "off",
       "scenario": "normal",
       "passed": false,
-      "project_qps": 813651.69,
-      "redis_qps": 835321.42,
-      "project_p99_us": 984.22,
-      "redis_p99_us": 1053.549
+      "project_qps": 833188.28,
+      "redis_qps": 852134.78,
+      "project_p99_us": 1011.493,
+      "redis_p99_us": 1031.025
     },
     {
       "workload": "hash-mixed",
@@ -90,10 +90,10 @@
       "policy": "everysec",
       "scenario": "normal",
       "passed": false,
-      "project_qps": 717059.1,
-      "redis_qps": 775495.46,
-      "project_p99_us": 1109.793,
-      "redis_p99_us": 1124.578
+      "project_qps": 737510.82,
+      "redis_qps": 757458.1,
+      "project_p99_us": 1098.956,
+      "redis_p99_us": 1189.523
     },
     {
       "workload": "hash-mixed",
@@ -101,10 +101,10 @@
       "policy": "everysec",
       "scenario": "bgsave",
       "passed": false,
-      "project_qps": 723447.26,
-      "redis_qps": 774665.64,
-      "project_p99_us": 1106.364,
-      "redis_p99_us": 1131.724
+      "project_qps": 744091.34,
+      "redis_qps": 794300.55,
+      "project_p99_us": 1063.731,
+      "redis_p99_us": 1088.851
     },
     {
       "workload": "hash-mixed",
@@ -112,10 +112,10 @@
       "policy": "off",
       "scenario": "normal",
       "passed": true,
-      "project_qps": 1301316.57,
-      "redis_qps": 1191994.12,
-      "project_p99_us": 2644.756,
-      "redis_p99_us": 3721.698
+      "project_qps": 1471940.27,
+      "redis_qps": 1218597.79,
+      "project_p99_us": 2379.951,
+      "redis_p99_us": 3274.698
     },
     {
       "workload": "hash-mixed",
@@ -123,10 +123,10 @@
       "policy": "everysec",
       "scenario": "normal",
       "passed": true,
-      "project_qps": 1225108.08,
-      "redis_qps": 1166462.6,
-      "project_p99_us": 2801.689,
-      "redis_p99_us": 3990.955
+      "project_qps": 1337241.72,
+      "redis_qps": 1194017.0,
+      "project_p99_us": 2570.224,
+      "redis_p99_us": 3520.296
     },
     {
       "workload": "hash-mixed",
@@ -134,10 +134,10 @@
       "policy": "everysec",
       "scenario": "bgsave",
       "passed": true,
-      "project_qps": 1207516.7,
-      "redis_qps": 1166533.49,
-      "project_p99_us": 2823.045,
-      "redis_p99_us": 3965.535
+      "project_qps": 1383255.92,
+      "redis_qps": 1219927.07,
+      "project_p99_us": 2484.352,
+      "redis_p99_us": 3559.333
     },
     {
       "workload": "zset-mixed",
@@ -145,10 +145,10 @@
       "policy": "off",
       "scenario": "normal",
       "passed": true,
-      "project_qps": 740988.4,
-      "redis_qps": 631443.04,
-      "project_p99_us": 1001.545,
-      "redis_p99_us": 1308.072
+      "project_qps": 760678.18,
+      "redis_qps": 658041.39,
+      "project_p99_us": 996.08,
+      "redis_p99_us": 1235.694
     },
     {
       "workload": "zset-mixed",
@@ -156,10 +156,10 @@
       "policy": "everysec",
       "scenario": "normal",
       "passed": true,
-      "project_qps": 731462.04,
-      "redis_qps": 626360.24,
-      "project_p99_us": 1276.584,
-      "redis_p99_us": 1298.632
+      "project_qps": 734461.1,
+      "redis_qps": 643565.01,
+      "project_p99_us": 1259.647,
+      "redis_p99_us": 1271.135
     },
     {
       "workload": "zset-mixed",
@@ -167,10 +167,10 @@
       "policy": "everysec",
       "scenario": "bgsave",
       "passed": true,
-      "project_qps": 720854.63,
-      "redis_qps": 624108.35,
-      "project_p99_us": 1291.443,
-      "redis_p99_us": 1302.053
+      "project_qps": 735472.51,
+      "redis_qps": 641985.85,
+      "project_p99_us": 1259.897,
+      "redis_p99_us": 1266.862
     },
     {
       "workload": "zset-mixed",
@@ -178,10 +178,10 @@
       "policy": "off",
       "scenario": "normal",
       "passed": true,
-      "project_qps": 1373887.81,
-      "redis_qps": 948233.92,
-      "project_p99_us": 2787.439,
-      "redis_p99_us": 3667.287
+      "project_qps": 1575172.14,
+      "redis_qps": 989564.83,
+      "project_p99_us": 2282.945,
+      "redis_p99_us": 3473.257
     },
     {
       "workload": "zset-mixed",
@@ -189,10 +189,10 @@
       "policy": "everysec",
       "scenario": "normal",
       "passed": true,
-      "project_qps": 1370832.19,
-      "redis_qps": 935250.98,
-      "project_p99_us": 2996.968,
-      "redis_p99_us": 3721.198
+      "project_qps": 1532505.25,
+      "redis_qps": 967684.69,
+      "project_p99_us": 2492.384,
+      "redis_p99_us": 3528.687
     },
     {
       "workload": "zset-mixed",
@@ -200,21 +200,20 @@
       "policy": "everysec",
       "scenario": "bgsave",
       "passed": true,
-      "project_qps": 1370283.46,
-      "redis_qps": 938899.45,
-      "project_p99_us": 2928.328,
-      "redis_p99_us": 3718.286
+      "project_qps": 1510698.38,
+      "redis_qps": 961113.03,
+      "project_p99_us": 2547.035,
+      "redis_p99_us": 3568.236
     }
   ],
   "failures": [
-    "string-mixed/P16: everysec QPS loss 7.23%",
-    "string-mixed/P64: everysec QPS loss 5.46%",
+    "string-mixed/P16: everysec QPS loss 6.90%",
+    "string-mixed/P64: everysec QPS loss 6.26%",
     "hash-mixed/P16/off: project must have QPS >= Redis and P99 <= Redis",
     "hash-mixed/P16/everysec: project must have QPS >= Redis and P99 <= Redis",
-    "hash-mixed/P16: everysec QPS loss 11.87%",
-    "hash-mixed/P16: everysec P99 growth 12.76%",
+    "hash-mixed/P16: everysec QPS loss 11.48%",
     "hash-mixed/P16/BGSAVE: project must have QPS >= Redis and P99 <= Redis",
-    "hash-mixed/P64: everysec QPS loss 5.86%",
-    "zset-mixed/P16: everysec P99 growth 27.46%"
+    "hash-mixed/P64: everysec QPS loss 9.15%",
+    "zset-mixed/P16: everysec P99 growth 26.46%"
   ]
 }
