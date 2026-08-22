@@ -71,8 +71,6 @@ typedef struct benchmark_options {
     int cleanup;
     int latency;
     int cold_miss;
-    int hot_get;
-    int preseeded_mixed;
     int run_id_set;
 } benchmark_options_t;
 
@@ -114,8 +112,6 @@ typedef struct worker {
     uint64_t set_latency_count;
     int latency_enabled;
     int cold_miss;
-    int get_only;
-    int skip_preload;
     unsigned int pipeline_depth;
     char *command_buffer;
     size_t command_buffer_capacity;
@@ -133,17 +129,15 @@ static void print_usage(const char *program)
             "Usage: %s [-s IPv4] [-p port] [-c connections] "
             "[-n total_requests] [-w warmup_gets_per_connection] "
             "[-P pipeline_depth] [-k keyspace] [-T ttl_ms] [-S seed] "
-            "[-R run_id] [-M|-G|-N] [-C] [-L]\n"
+            "[-R run_id] [-M] [-C] [-L]\n"
             "  -k  Total shared keyspace; all keys are preloaded before timing.\n"
             "  -T  Apply SET PX ttl_ms during preload and measured writes; 0 disables TTL.\n"
             "  -R  Use a stable numeric run ID in mixed:<run_id>:<index> keys.\n"
             "  -M  MySQL full-cold mode: unique GET-only keys, no preload/warmup/cleanup.\n"
             "      Requires -R, -w 0, and keyspace >= total_requests.\n"
-            "  -G  Preseeded hot GET-only mode: random GET, no preload/cleanup; requires -R.\n"
-            "  -N  Preseeded 90%% GET/10%% SET mode: no preload/cleanup; requires -R.\n"
             "  -C  Keep benchmark keys instead of deleting them after the run.\n"
             "  -L  Measure per-response latency percentiles (adds client overhead).\n"
-            "total_requests must be a multiple of 10 except in GET-only modes.\n"
+            "total_requests must be a multiple of 10 except in -M mode.\n"
             "Defaults: -s %s -p %u -c %u -n %u -w %u -P %u "
             "-k %u -T 0 -S %u, cleanup enabled\n",
             program,
@@ -192,7 +186,7 @@ static int parse_options(int argc, char **argv, benchmark_options_t *options)
     options->seed = DEFAULT_SEED;
     options->cleanup = 1;
 
-    while ((option = getopt(argc, argv, "s:p:c:n:w:P:k:T:S:R:MGNCLh")) != -1) {
+    while ((option = getopt(argc, argv, "s:p:c:n:w:P:k:T:S:R:MCLh")) != -1) {
         uint64_t value;
 
         switch (option) {
@@ -235,14 +229,6 @@ static int parse_options(int argc, char **argv, benchmark_options_t *options)
             options->cold_miss = 1;
             options->cleanup = 0;
             break;
-        case 'G':
-            options->hot_get = 1;
-            options->cleanup = 0;
-            break;
-        case 'N':
-            options->preseeded_mixed = 1;
-            options->cleanup = 0;
-            break;
         case 'C':
             options->cleanup = 0;
             break;
@@ -257,14 +243,10 @@ static int parse_options(int argc, char **argv, benchmark_options_t *options)
         }
     }
     if (optind != argc || options->requests < options->connections ||
-        options->cold_miss + options->hot_get + options->preseeded_mixed > 1 ||
-        (!options->cold_miss && !options->hot_get &&
-         options->requests % 10U != 0U) ||
+        (!options->cold_miss && options->requests % 10U != 0U) ||
         (options->cold_miss &&
          (!options->run_id_set || options->warmup != 0U ||
-          options->keyspace < options->requests || options->ttl_ms != 0U)) ||
-        ((options->hot_get || options->preseeded_mixed) &&
-         (!options->run_id_set || options->ttl_ms != 0U))) {
+          options->keyspace < options->requests || options->ttl_ms != 0U))) {
         return -1;
     }
     return 0;
@@ -883,7 +865,7 @@ static int execute_random_requests(worker_t *worker,
                                      : next_random(worker) % worker->keyspace;
             operation_type_t operation = OPERATION_GET;
 
-            if (!worker->get_only && phase == PHASE_MEASURED &&
+            if (!worker->cold_miss && phase == PHASE_MEASURED &&
                 operation_is_set(worker->request_start + offset + index,
                                  worker->schedule_seed)) {
                 operation = OPERATION_SET;
@@ -932,11 +914,11 @@ static void *worker_main(void *argument)
 {
     worker_t *worker = argument;
 
-    if ((!worker->skip_preload &&
-         execute_preload_or_cleanup(worker, PHASE_PRELOAD) != 0) ||
-        execute_random_requests(worker,
-                                worker->warmup_count,
-                                PHASE_WARMUP) != 0) {
+    if (!worker->cold_miss &&
+        (execute_preload_or_cleanup(worker, PHASE_PRELOAD) != 0 ||
+         execute_random_requests(worker,
+                                 worker->warmup_count,
+                                 PHASE_WARMUP) != 0)) {
         worker->error_number = errno != 0 ? errno : EIO;
     }
     if (wait_for_start(worker) || worker->error_number != 0) return NULL;
@@ -1134,9 +1116,6 @@ static int prepare_worker(worker_t *worker,
     worker->schedule_seed = options->seed;
     worker->latency_enabled = options->latency;
     worker->cold_miss = options->cold_miss;
-    worker->get_only = options->cold_miss || options->hot_get;
-    worker->skip_preload = options->cold_miss || options->hot_get ||
-                           options->preseeded_mixed;
     worker->random_state = mix_u64(options->seed ^ ((uint64_t)worker_id + 1U));
     if (worker->random_state == 0U) worker->random_state = 1U;
     worker->control = control;
@@ -1146,7 +1125,7 @@ static int prepare_worker(worker_t *worker,
         malloc(sizeof(*worker->pipeline_operations) * options->pipeline);
     worker->receive_buffer = malloc(RECEIVE_BUFFER_SIZE);
     if (worker->latency_enabled) {
-        worker->set_latency_capacity = worker->get_only
+        worker->set_latency_capacity = options->cold_miss
                                            ? 0U
                                            : count_set_operations(request_start,
                                                                   request_count,
@@ -1344,9 +1323,7 @@ int main(int argc, char **argv)
         strcpy(client_host, "unknown");
     }
     client_host[sizeof(client_host) - 1U] = '\0';
-    requested_sets = (options.cold_miss || options.hot_get)
-                         ? 0U
-                         : options.requests / 10U;
+    requested_sets = options.cold_miss ? 0U : options.requests / 10U;
     requested_gets = options.requests - requested_sets;
     if (options.latency) {
         size_t get_position = 0;
@@ -1420,11 +1397,7 @@ int main(int argc, char **argv)
         printf("benchmark: %s\n",
                options.cold_miss
                    ? "RESP2 MySQL full-cold unique-key GET"
-                   : options.hot_get
-                         ? "RESP2 preseeded hot-cache GET"
-                         : options.preseeded_mixed
-                               ? "RESP2 preseeded 90% GET / 10% SET"
-                               : "RESP2 shared-keyspace 90% GET / 10% SET");
+                   : "RESP2 shared-keyspace 90% GET / 10% SET");
         printf("server: %s:%u\n", options.server, options.port);
         printf("client_host: %s\n", client_host);
         printf("connections: %u\n", options.connections);
@@ -1435,10 +1408,6 @@ int main(int argc, char **argv)
         printf("stable_run_id: %" PRIu64 "\n", run_id);
         printf("full_cold_mysql_miss_mode: %s\n",
                options.cold_miss ? "enabled" : "disabled");
-        printf("preseeded_hot_get_mode: %s\n",
-               options.hot_get ? "enabled" : "disabled");
-        printf("preseeded_mixed_mode: %s\n",
-               options.preseeded_mixed ? "enabled" : "disabled");
         printf("value_bytes: %u\n", VALUE_SIZE);
         printf("ttl_ms: %" PRIu64 "\n", options.ttl_ms);
         printf("random_seed: %" PRIu64 "\n", options.seed);

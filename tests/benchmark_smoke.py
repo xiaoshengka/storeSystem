@@ -55,15 +55,6 @@ def load_release_gate_module():
     return module
 
 
-def load_mysql_performance_gate_module():
-    path = Path("bench/mysql_performance_gate.py")
-    spec = spec_from_file_location("mysql_performance_gate", path)
-    assert spec is not None and spec.loader is not None
-    module = module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_collection_compare_matrix() -> None:
     module = load_collection_compare_module()
     cases = module.build_cases(
@@ -127,33 +118,6 @@ def test_release_gate_selection() -> None:
                 })
     winner, _, relative = module.select_zset(rows, 5)
     assert relative <= 0.01 and winner == "skiplist"
-
-
-def test_mysql_performance_gate_math() -> None:
-    module = load_mysql_performance_gate_module()
-    summaries = []
-    for scenario in ("hot-get", "hot-write"):
-        summaries.extend([
-            {
-                "scenario": scenario, "target": "mysql-off", "pipeline": 16,
-                "qps_median": 100.0, "qps_cv_percent": 1.0,
-                "p99_us_median": 100.0,
-            },
-            {
-                "scenario": scenario, "target": "mysql-on", "pipeline": 16,
-                "qps_median": 96.0 if scenario == "hot-get" else 91.0,
-                "qps_cv_percent": 2.0,
-                "p99_us_median": 109.0 if scenario == "hot-get" else 119.0,
-            },
-        ])
-    args = SimpleNamespace(
-        scenarios=("hot-get", "hot-write"), pipelines=(16,),
-        max_cv_percent=5.0,
-    )
-    gate = module.evaluate_gate(args, summaries)
-    assert gate["passed"]
-    summaries[1]["qps_median"] = 94.0
-    assert not module.evaluate_gate(args, summaries)["passed"]
 
 
 def test_string_mixed_compare_script() -> None:
@@ -247,54 +211,6 @@ def test_latency_metrics() -> None:
         assert float(metrics[name]) >= 0.0
     assert float(metrics["latency_p50_us"]) <= float(metrics["latency_p99_us"])
     assert float(metrics["latency_p99_us"]) <= float(metrics["latency_max_us"])
-
-
-def test_preseeded_mixed_modes() -> None:
-    run_id = 4242
-    keyspace = 100
-    server = subprocess.Popen(
-        ["./kvstore", "--maxkeys", "4096"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        wait_for_server(server)
-        value = b"0123456789abcdef" * 4
-        for index in range(keyspace):
-            assert exchange(
-                b"SET", f"mixed:{run_id}:{index}".encode("ascii"), value
-            ) == ("simple", b"OK")
-
-        hot_get = subprocess.run(
-            [
-                "./mixed_qps_client", "-c", "2", "-n", "1000",
-                "-w", "10", "-P", "4", "-k", str(keyspace),
-                "-R", str(run_id), "-G", "-L",
-            ],
-            check=True, capture_output=True, text=True, timeout=30.0,
-        )
-        hot_metrics = parse_metrics(hot_get.stdout)
-        assert hot_metrics["preseeded_hot_get_mode"] == "enabled"
-        assert int(hot_metrics["get_completed"]) == 1000
-        assert int(hot_metrics["get_hits"]) == 1000
-        assert int(hot_metrics["set_completed"]) == 0
-
-        mixed = subprocess.run(
-            [
-                "./mixed_qps_client", "-c", "2", "-n", "1000",
-                "-w", "10", "-P", "4", "-k", str(keyspace),
-                "-R", str(run_id), "-N", "-L",
-            ],
-            check=True, capture_output=True, text=True, timeout=30.0,
-        )
-        mixed_metrics = parse_metrics(mixed.stdout)
-        assert mixed_metrics["preseeded_mixed_mode"] == "enabled"
-        assert int(mixed_metrics["get_completed"]) == 900
-        assert int(mixed_metrics["set_completed"]) == 100
-        assert int(mixed_metrics["set_errors"]) == 0
-    finally:
-        stop_server(server)
 
 
 def test_collection_metrics() -> None:
@@ -427,10 +343,8 @@ def test_latency_benchmark_script() -> None:
 def main() -> int:
     test_collection_compare_matrix()
     test_release_gate_selection()
-    test_mysql_performance_gate_math()
     test_string_mixed_compare_script()
     test_latency_metrics()
-    test_preseeded_mixed_modes()
     test_collection_metrics()
     test_replay_benchmark()
     test_latency_benchmark_script()

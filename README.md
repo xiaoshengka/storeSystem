@@ -51,9 +51,7 @@ sudo apt-get install default-libmysqlclient-dev
 make MYSQL=1
 ```
 
-`MYSQL=0` 是默认值，不链接 `libmysqlclient`，保持 v0.6.2 请求路径。默认对象目录按
-开关隔离为 `build/epoll-mysql0` 与 `build/epoll-mysql1`，切换 `MYSQL` 时不会复用
-错误编译选项下的旧对象。
+`MYSQL=0` 是默认值，不链接 `libmysqlclient`，保持 v0.6.2 请求路径。
 
 默认构建要求 jemalloc 且缺失时直接失败。仅诊断 allocator 差异时可使用
 `make ALLOCATOR=libc`；ASan/UBSan 和 Valgrind 目标自动使用 libc allocator。
@@ -239,10 +237,6 @@ make test
 make integration-test
 make benchmark-test
 KVSTORE_MYSQL_TEST_PASSWORD='replace-me' make mysql-integration-test
-KVSTORE_MYSQL_TEST_PASSWORD='replace-me' make mysql-performance-gate
-KVSTORE_MYSQL_TEST_PASSWORD='replace-me' make mysql-asan
-KVSTORE_MYSQL_TEST_PASSWORD='replace-me' make mysql-valgrind
-KVSTORE_MYSQL_TEST_PASSWORD='replace-me' make mysql-helgrind
 make asan
 make valgrind
 make helgrind
@@ -260,10 +254,6 @@ make helgrind
   `make helgrind` 专门覆盖 AOF writer 与 Reactor eventfd 协作。
 - `make benchmark-test` 对 AOF 重放脚本和可选延迟采样做小规模 smoke test，不是
   性能基线。
-- `make mysql-performance-gate` 使用预置 AOF 分别运行 MySQL 关闭/开启的纯热 GET
-  与 90% GET/10% SET 写回对照，按 Pipeline 独立计算 5 轮中位数、CV 和门禁结果。
-- `mysql-asan/mysql-valgrind/mysql-helgrind` 使用独立构建目录运行 MySQL 集成路径；
-  Valgrind/Helgrind 通过 `KVSTORE_MYSQL_SERVER_PREFIX` 包装每个被测服务进程。
 
 NtyCo 只作为历史对照后端：
 
