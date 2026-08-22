@@ -1,14 +1,15 @@
 CC ?= gcc
 NETWORK_BACKEND ?= epoll
-BUILD_DIR ?= build/$(NETWORK_BACKEND)
+MYSQL ?= 0
+BUILD_DIR ?= build/$(NETWORK_BACKEND)-mysql$(MYSQL)
 
 CPPFLAGS ?= -Iinclude
 CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic
 DEPFLAGS ?= -MMD -MP
 LDFLAGS ?=
 LDLIBS ?=
-MYSQL ?= 0
 MYSQL_COLD_MISS_ARGS ?=
+MYSQL_PERFORMANCE_GATE_ARGS ?=
 
 ifeq ($(MYSQL),1)
 MYSQL_CFLAGS := $(shell pkg-config --cflags mysqlclient 2>/dev/null)
@@ -114,7 +115,13 @@ ALL_OBJS := $(SERVER_OBJS) $(BUFFER_TEST_OBJS) $(KV_TEST_OBJS) \
 	$(REACTOR_ASYNC_TEST_OBJS) \
 	$(QPS_CLIENT_OBJ) $(MIXED_QPS_CLIENT_OBJ) $(COLLECTION_BENCH_CLIENT_OBJ)
 
-.PHONY: all clean test integration-test mysql-integration-test mysql-cold-miss-bench benchmark-test asan valgrind valgrind-run helgrind ntyco
+LINK_TARGETS := $(SERVER_TARGET) legacy_client qps_client mixed_qps_client \
+	collection_bench_client test_buffer test_kvstore test_resp test_hash \
+	test_object test_cache test_resp_service test_aof test_rdb \
+	test_reactor_async
+
+.PHONY: all clean test integration-test mysql-integration-test mysql-cold-miss-bench mysql-performance-gate mysql-asan mysql-valgrind mysql-helgrind benchmark-test asan valgrind valgrind-run helgrind ntyco
+.PHONY: $(LINK_TARGETS)
 
 all: $(SERVER_TARGET) legacy_client qps_client mixed_qps_client collection_bench_client
 
@@ -194,6 +201,27 @@ mysql-integration-test:
 mysql-cold-miss-bench:
 	$(MAKE) MYSQL=1 kvstore mixed_qps_client
 	python3 bench/mysql_cold_miss_bench.py $(MYSQL_COLD_MISS_ARGS)
+
+mysql-performance-gate:
+	$(MAKE) MYSQL=1 kvstore mixed_qps_client
+	python3 bench/mysql_performance_gate.py $(MYSQL_PERFORMANCE_GATE_ARGS)
+
+mysql-asan:
+	$(MAKE) MYSQL=1 ALLOCATOR=libc BUILD_DIR=build/asan-mysql \
+		CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
+		LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" test kvstore
+	ASAN_OPTIONS=detect_leaks=1 python3 tests/mysql_integration.py
+
+mysql-valgrind:
+	$(MAKE) MYSQL=1 ALLOCATOR=libc BUILD_DIR=build/valgrind-mysql kvstore
+	KVSTORE_MYSQL_SERVER_PREFIX="valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1" \
+		python3 tests/mysql_integration.py
+
+mysql-helgrind:
+	$(MAKE) MYSQL=1 ALLOCATOR=libc BUILD_DIR=build/helgrind-mysql \
+		CFLAGS="$(CFLAGS) -DKVSTORE_HELGRIND" kvstore
+	KVSTORE_MYSQL_SERVER_PREFIX="valgrind --tool=helgrind --error-exitcode=1" \
+		python3 tests/mysql_integration.py
 
 benchmark-test: kvstore mixed_qps_client collection_bench_client
 	python3 tests/benchmark_smoke.py
