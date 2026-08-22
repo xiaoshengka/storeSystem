@@ -2,9 +2,9 @@
 
 基于 Linux C、非阻塞 Socket 与单线程 epoll Reactor 的内存 KV 缓存服务。
 
-当前发布版本为 `v0.6.2`：新增项目原生 RDB、同步 `SAVE`、fork 子进程异步
-`BGSAVE`、自动快照以及 RDB+AOF 检查点尾部恢复。网络仍是单线程 epoll Reactor；
-后台执行单元只有 AOF writer 和 BGSAVE 子进程，不引入 io_uring。
+当前发布版本为 `v0.7.0`：在 v0.6.2 的 RDB+AOF 热快照基础上新增可选 MySQL
+Cache-Aside 最终数据层，支持异步回源与写回、空值缓存、同 key 请求合并、启动对账
+和运行期故障降级。MySQL 默认关闭；关闭时保持原有内存、AOF 与 RDB 路径。
 
 ## 架构
 
@@ -17,11 +17,14 @@ Client
   -> 类型对象（Hash；成员 Hash + SkipList/RBTree ZSet）
   -> AOF（命令 transaction + chunk SPSC 队列 + writer writev/fdatasync + mmap 回放）
   -> RDB（KVRDB001 + CRC64 + fork BGSAVE + 原子替换）
+  -> MySQL（Cache-Aside + 读连接池 + 全局有序 writer + AOF mutation 对账）
 ```
 
 Reactor 负责连接、非阻塞收发、Pipeline 背压、周期回调和资源回收；协议层只处理
 RESP 字节帧；服务层负责命令语义；Cache 不依赖网络或 RESP；Hash 只负责二进制
-key 的索引。v0.6.2 设计与验收口径见
+key 的索引。v0.7.0 的设计、部署和实测结果见
+[`docs/v0.7.0-mysql-cache-aside.md`](docs/v0.7.0-mysql-cache-aside.md)，发布说明见
+[`docs/releases/v0.7.0.md`](docs/releases/v0.7.0.md)；v0.6.2 设计与验收口径见
 [`docs/v0.6.2-rdb-performance.md`](docs/v0.6.2-rdb-performance.md)；v0.6.1 设计见
 [`docs/v0.6.1-memory-aof.md`](docs/v0.6.1-memory-aof.md)；v0.6 集合设计见
 [`docs/typed-collections-v0.6.md`](docs/typed-collections-v0.6.md)；v0.5.1 AOF 设计见
@@ -51,7 +54,7 @@ sudo apt-get install default-libmysqlclient-dev
 make MYSQL=1
 ```
 
-`MYSQL=0` 是默认值，不链接 `libmysqlclient`，保持 v0.6.2 请求路径。
+`MYSQL=0` 是默认值，不链接 `libmysqlclient`，保持原有内存、AOF 与 RDB 请求路径。
 
 默认构建要求 jemalloc 且缺失时直接失败。仅诊断 allocator 差异时可使用
 `make ALLOCATOR=libc`；ASan/UBSan 和 Valgrind 目标自动使用 libc allocator。
@@ -327,9 +330,9 @@ Cache 冷，数据库缓冲为热。测试脚本要求每轮全部 GET 返回预
 
 QPS 范围为 23,343.86–27,525.39，五轮总体 CV 为 5.67%；P99 范围为
 1.850–2.179 ms。第 5 轮明显偏低，因此该数据作为完整披露的阶段实测中位数，不能
-宣称为波动低于 5% 的稳定门禁。简历可表述为：“在 32 并发、64B value、全量冷 key
-miss 条件下，MySQL 回源吞吐约 26.9K QPS，P99 延迟约 1.97 ms（5 轮中位数，
-Pipeline=1）。”测试方法和未完成门禁见
+宣称为波动低于 5% 的稳定门禁。该版本的实测结论为：“在 32 并发、64B value、
+Pipeline=1、全量冷 key miss 条件下，MySQL 回源吞吐约 26.9K QPS，P99 延迟约
+1.97 ms（5 轮中位数）。”完整方法和逐轮结果见
 [`docs/v0.7.0-mysql-cache-aside.md`](docs/v0.7.0-mysql-cache-aside.md)。
 
 ### Redis 6.2.23 Hash/ZSet 对照
@@ -623,9 +626,8 @@ v0.4 的阶段性能基线及解释记录在发布说明中；以上 v0.5.1 数�
 
 ## 当前限制
 
-- v0.7.0 已完成 MySQL Cache-Aside 功能和全量冷 String miss 实测，但 100% 内存命中、
-  热写回、热点合并/断库性能及当前版本完整 sanitizer/Valgrind/Helgrind 发布矩阵尚未
-  闭环，因此当前 feature 分支不应创建正式 `v0.7.0` tag/Release。
+- v0.7.0 的性能结论限定为 32 并发、64B value、Pipeline=1、全量冷 String key miss
+  且 MySQL buffer pool 为热的场景；不外推为冷盘读取、其他 Pipeline 或生产容量结论。
 - v0.6.2 在明确接受严格门禁 `passed: false` 的前提下发布：Hash P16 的三个 Redis
   对照单元 QPS 未达标，且 String/Hash 的部分 everysec QPS 损失与 ZSet P16
   everysec P99 增幅超过原门槛；详见上文验收表和原始结果文件。
