@@ -172,6 +172,13 @@ int main(void)
     assert(strstr((const char *)reply.data, "rdb_enabled:1\r\n") != NULL);
     assert(strstr((const char *)reply.data,
                   "rdb_checkpoint_offset:321\r\n") != NULL);
+    arguments[1] = argument("MYSQL", 5);
+    reply = execute(&service, arguments, 2U);
+    assert(reply.type == KVSTORE_REPLY_BULK);
+    assert(strstr((const char *)reply.data,
+                  "mysql_enabled:0\r\n") != NULL);
+    assert(strstr((const char *)reply.data,
+                  "mysql_pending_write_bytes:0\r\n") != NULL);
 
     arguments[0] = argument("PING", 4);
     reply = execute(&service, arguments, 1U);

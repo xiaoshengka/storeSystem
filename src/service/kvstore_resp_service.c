@@ -21,6 +21,8 @@ static const unsigned char error_integer[] =
 static const unsigned char error_expire[] = "ERR invalid expire time in SET";
 static const unsigned char error_capacity[] = "ERR cache capacity exceeded";
 static const unsigned char error_aof[] = "ERR AOF persistence unavailable";
+static const unsigned char error_mysql_queue[] =
+    "TRYAGAIN MySQL writer queue is above the high-water mark";
 static const unsigned char error_wrongtype[] =
     "WRONGTYPE Operation against a key holding the wrong kind of value";
 static const unsigned char error_float[] = "ERR value is not a valid float";
@@ -400,6 +402,57 @@ static aof_argument_t aof_argument(const void *data, size_t length)
     return result;
 }
 
+static int capture_mysql_mutation(kvstore_service_t *service,
+                                  const aof_argument_t *arguments,
+                                  size_t argument_count)
+{
+    size_t required = 0;
+    size_t capacity;
+    unsigned char *replacement;
+
+    if (!service->mysql_recording_command || service->mysql_store == NULL)
+        return 0;
+    if (argument_count == 0 || argument_count > 128U) return -1;
+    for (size_t index = 0; index < argument_count; ++index) {
+        if (arguments[index].length > SIZE_MAX - required) return -1;
+        required += arguments[index].length;
+    }
+    if (required > service->mysql_mutation_buffer_capacity) {
+        capacity = service->mysql_mutation_buffer_capacity == 0
+                       ? 512U : service->mysql_mutation_buffer_capacity;
+        while (capacity < required) {
+            if (capacity > SIZE_MAX / 2U) {
+                capacity = required;
+                break;
+            }
+            capacity *= 2U;
+        }
+        replacement = realloc(service->mysql_mutation_buffer, capacity);
+        if (replacement == NULL) return -1;
+        service->mysql_mutation_buffer = replacement;
+        service->mysql_mutation_buffer_capacity = capacity;
+    }
+    service->mysql_mutation_buffer_used = 0;
+    service->mysql_mutation_count = argument_count;
+    for (size_t index = 0; index < argument_count; ++index) {
+        unsigned char *destination = service->mysql_mutation_buffer +
+                                     service->mysql_mutation_buffer_used;
+        memcpy(destination, arguments[index].data, arguments[index].length);
+        service->mysql_mutation_arguments[index].data = destination;
+        service->mysql_mutation_arguments[index].length = arguments[index].length;
+        service->mysql_mutation_buffer_used += arguments[index].length;
+    }
+    return 0;
+}
+
+static int append_aof_record(kvstore_service_t *service,
+                             const aof_argument_t *arguments,
+                             size_t argument_count)
+{
+    if (aof_append(service->aof, arguments, argument_count) != 0) return -1;
+    return capture_mysql_mutation(service, arguments, argument_count);
+}
+
 static int append_key_command(kvstore_service_t *service,
                               const char *command,
                               const kvstore_argument_t *key)
@@ -411,7 +464,7 @@ static int append_key_command(kvstore_service_t *service,
     }
     arguments[0] = aof_argument(command, strlen(command));
     arguments[1] = aof_argument(key->data, key->length);
-    return aof_append(service->aof, arguments, 2U);
+    return append_aof_record(service, arguments, 2U);
 }
 
 static int append_deadline_command(kvstore_service_t *service,
@@ -436,7 +489,7 @@ static int append_deadline_command(kvstore_service_t *service,
     arguments[0] = aof_argument(command, strlen(command));
     arguments[1] = aof_argument(key->data, key->length);
     arguments[2] = aof_argument(deadline_text, (size_t)length);
-    return aof_append(service->aof, arguments, 3U);
+    return append_aof_record(service, arguments, 3U);
 }
 
 static int append_set_command(kvstore_service_t *service,
@@ -466,7 +519,7 @@ static int append_set_command(kvstore_service_t *service,
         record[4] = aof_argument(deadline_text, (size_t)length);
         count = 5U;
     }
-    return aof_append(service->aof, record, count);
+    return append_aof_record(service, record, count);
 }
 
 static int append_original_command(kvstore_service_t *service,
@@ -482,7 +535,46 @@ static int append_original_command(kvstore_service_t *service,
         record[index] = aof_argument(arguments[index].data,
                                      arguments[index].length);
     }
-    return aof_append(service->aof, record, argument_count);
+    return append_aof_record(service, record, argument_count);
+}
+
+static int append_mysql_marker(kvstore_service_t *service, uint64_t sequence)
+{
+    static const char hexadecimal[] = "0123456789abcdef";
+    aof_argument_t marker[2];
+    unsigned char text[64];
+    size_t position = 0;
+    int written;
+
+    memcpy(text, "KVMYSQL1:", 9U);
+    position = 9U;
+    for (size_t index = 0; index < sizeof(service->mysql_writer_uuid); ++index) {
+        text[position++] = (unsigned char)hexadecimal[
+            service->mysql_writer_uuid[index] >> 4U];
+        text[position++] = (unsigned char)hexadecimal[
+            service->mysql_writer_uuid[index] & 0x0fU];
+    }
+    text[position++] = ':';
+    written = snprintf((char *)text + position,
+                       sizeof(text) - position,
+                       "%" PRIu64, sequence);
+    if (written < 0 || (size_t)written >= sizeof(text) - position) return -1;
+    position += (size_t)written;
+    marker[0] = aof_argument("PING", 4U);
+    marker[1] = aof_argument(text, position);
+    return aof_append(service->aof, marker, 2U);
+}
+
+static size_t mysql_write_estimate(const kvstore_argument_t *arguments,
+                                   size_t argument_count)
+{
+    size_t amount = 128U;
+
+    for (size_t index = 0; index < argument_count; ++index) {
+        if (arguments[index].length > SIZE_MAX - amount) return SIZE_MAX;
+        amount += arguments[index].length;
+    }
+    return amount;
 }
 
 static void record_eviction(const void *key,
@@ -558,6 +650,7 @@ void kvstore_service_destroy(kvstore_service_t *service)
     cache_destroy(service->cache);
     free(service->reply_elements);
     free(service->reply_score_buffer);
+    free(service->mysql_mutation_buffer);
     memset(service, 0, sizeof(*service));
 }
 
@@ -589,6 +682,20 @@ void kvstore_service_attach_aof(kvstore_service_t *service, aof_t *aof)
     if (service != NULL && service->initialized) {
         service->aof = aof;
     }
+}
+
+void kvstore_service_attach_mysql(kvstore_service_t *service,
+                                  mysql_store_t *store,
+                                  const unsigned char writer_uuid[16],
+                                  uint64_t next_sequence)
+{
+    if (service == NULL || !service->initialized) return;
+    service->mysql_store = store;
+    service->mysql_next_sequence = next_sequence;
+    memset(service->mysql_writer_uuid, 0, sizeof(service->mysql_writer_uuid));
+    if (store != NULL && writer_uuid != NULL)
+        memcpy(service->mysql_writer_uuid, writer_uuid,
+               sizeof(service->mysql_writer_uuid));
 }
 
 void kvstore_service_set_persistence_admin(
@@ -1382,6 +1489,8 @@ static int command_arity_valid(enum service_command command,
 
 static int execute_persistence_info(kvstore_service_t *service,
                                     kvstore_reply_t *reply);
+static int execute_mysql_info(kvstore_service_t *service,
+                              kvstore_reply_t *reply);
 
 static int execute_save_command(kvstore_service_t *service,
                                 int background,
@@ -1535,6 +1644,9 @@ static int execute_command(kvstore_service_t *service,
         if (argument_equals(&arguments[1], "PERSISTENCE")) {
             return execute_persistence_info(service, reply);
         }
+        if (argument_equals(&arguments[1], "MYSQL")) {
+            return execute_mysql_info(service, reply);
+        }
         if (!argument_equals(&arguments[1], "CACHE")) {
             set_error(reply, error_syntax, sizeof(error_syntax) - 1U);
             return 0;
@@ -1675,6 +1787,8 @@ int kvstore_service_execute_with_barrier(kvstore_service_t *service,
     enum service_command command;
     int logical_write;
     int write_command;
+    int mysql_write;
+    size_t mysql_bytes = 0;
     int result;
 
     if (response_barrier != NULL) *response_barrier = 0;
@@ -1685,6 +1799,27 @@ int kvstore_service_execute_with_barrier(kvstore_service_t *service,
                     command_arity_valid(command, argument_count) &&
                     is_write_command(command);
     write_command = logical_write && service->aof != NULL;
+    mysql_write = logical_write && service->mysql_store != NULL;
+    if (mysql_write) {
+        mysql_bytes = mysql_write_estimate(arguments, argument_count);
+        if (service->aof == NULL) {
+            memset(reply, 0, sizeof(*reply));
+            set_aof_error(reply);
+            return 0;
+        }
+        if (mysql_bytes == SIZE_MAX ||
+            !mysql_store_can_accept_write(service->mysql_store, mysql_bytes)) {
+            memset(reply, 0, sizeof(*reply));
+            set_error(reply, error_mysql_queue, sizeof(error_mysql_queue) - 1U);
+            return 0;
+        }
+        service->mysql_candidate_sequence = service->mysql_next_sequence + 1U;
+        if (service->mysql_candidate_sequence == 0) {
+            memset(reply, 0, sizeof(*reply));
+            set_error(reply, error_internal, sizeof(error_internal) - 1U);
+            return 0;
+        }
+    }
     if (write_command && aof_transaction_begin(service->aof) != 0) {
         static const unsigned char busy[] =
             "TRYAGAIN AOF writer queue is above the high-water mark";
@@ -1693,7 +1828,11 @@ int kvstore_service_execute_with_barrier(kvstore_service_t *service,
         set_error(reply, busy, sizeof(busy) - 1U);
         return 0;
     }
+    service->mysql_mutation_count = 0;
+    service->mysql_mutation_buffer_used = 0;
+    service->mysql_recording_command = mysql_write;
     result = execute_command(service, command, arguments, argument_count, reply);
+    service->mysql_recording_command = 0;
     if (result == 0 && logical_write && reply->type != KVSTORE_REPLY_ERROR) {
         service->dirty_changes++;
     }
@@ -1702,9 +1841,25 @@ int kvstore_service_execute_with_barrier(kvstore_service_t *service,
         aof_transaction_rollback(service->aof);
         return result;
     }
+    if (mysql_write && service->mysql_mutation_count > 0 &&
+        append_mysql_marker(service, service->mysql_candidate_sequence) != 0) {
+        aof_transaction_rollback(service->aof);
+        set_aof_error(reply);
+        return 0;
+    }
     if (aof_transaction_commit(service->aof, response_barrier) != 0) {
         aof_transaction_rollback(service->aof);
         set_aof_error(reply);
+    } else if (mysql_write && service->mysql_mutation_count > 0) {
+        service->mysql_next_sequence = service->mysql_candidate_sequence;
+        if (mysql_store_submit_mutation(
+                service->mysql_store,
+                service->mysql_candidate_sequence,
+                service->mysql_mutation_arguments,
+                service->mysql_mutation_count,
+                mysql_bytes) != 0) {
+            set_error(reply, error_mysql_queue, sizeof(error_mysql_queue) - 1U);
+        }
     }
     return 0;
 }
@@ -1777,6 +1932,60 @@ static int execute_persistence_info(kvstore_service_t *service,
                         persistence.last_child_major_faults,
                         persistence.last_save_status,
                        persistence.checkpoint_offset);
+    if (written < 0 || (size_t)written >= sizeof(service->info_buffer)) {
+        set_error(reply, error_internal, sizeof(error_internal) - 1U);
+    } else {
+        set_data_reply(reply, KVSTORE_REPLY_BULK, service->info_buffer,
+                       (size_t)written);
+    }
+    return 0;
+}
+
+static int execute_mysql_info(kvstore_service_t *service,
+                              kvstore_reply_t *reply)
+{
+    mysql_store_stats_t stats;
+    int written;
+
+    mysql_store_get_stats(service->mysql_store, &stats);
+    written = snprintf((char *)service->info_buffer,
+                       sizeof(service->info_buffer),
+                       "mysql_enabled:%d\r\n"
+                       "mysql_read_workers:%zu\r\n"
+                       "mysql_connected_readers:%zu\r\n"
+                       "mysql_connected_writer:%d\r\n"
+                       "mysql_pending_reads:%zu\r\n"
+                       "mysql_read_queue_limit:%zu\r\n"
+                       "mysql_pending_write_bytes:%zu\r\n"
+                       "mysql_write_queue_max_bytes:%zu\r\n"
+                       "mysql_load_max_bytes:%zu\r\n"
+                       "mysql_submitted_sequence:%" PRIu64 "\r\n"
+                       "mysql_applied_sequence:%" PRIu64 "\r\n"
+                       "mysql_loads:%" PRIu64 "\r\n"
+                       "mysql_coalesced_loads:%" PRIu64 "\r\n"
+                       "mysql_negative_cache_hits:%" PRIu64 "\r\n"
+                       "mysql_load_errors:%" PRIu64 "\r\n"
+                       "mysql_write_errors:%" PRIu64 "\r\n"
+                       "mysql_reconnects:%" PRIu64 "\r\n"
+                       "mysql_last_error:%u\r\n",
+                       service->mysql_store != NULL,
+                       stats.read_workers,
+                       stats.connected_readers,
+                       stats.connected_writer,
+                       stats.pending_reads,
+                       stats.read_queue_limit,
+                       stats.pending_write_bytes,
+                       stats.write_queue_max_bytes,
+                       stats.load_max_bytes,
+                       stats.submitted_sequence,
+                       stats.applied_sequence,
+                       stats.loads,
+                       stats.coalesced_loads,
+                       stats.negative_cache_hits,
+                       stats.load_errors,
+                       stats.write_errors,
+                       stats.reconnects,
+                       stats.last_error);
     if (written < 0 || (size_t)written >= sizeof(service->info_buffer)) {
         set_error(reply, error_internal, sizeof(error_internal) - 1U);
     } else {

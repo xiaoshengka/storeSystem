@@ -44,6 +44,15 @@ sudo apt-get install build-essential pkg-config libjemalloc-dev
 make
 ```
 
+MySQL Cache-Aside 是可选构建；启用时还需安装客户端开发包并显式编译：
+
+```bash
+sudo apt-get install default-libmysqlclient-dev
+make MYSQL=1
+```
+
+`MYSQL=0` 是默认值，不链接 `libmysqlclient`，保持 v0.6.2 请求路径。
+
 默认构建要求 jemalloc 且缺失时直接失败。仅诊断 allocator 差异时可使用
 `make ALLOCATOR=libc`；ASan/UBSan 和 Valgrind 目标自动使用 libc allocator。
 
@@ -69,6 +78,10 @@ make
 ./kvstore --rdb yes --dbfilename dump.kvrdb
 ./kvstore --rdb yes --dbfilename dump.kvrdb \
   --save-seconds 60 --save-changes 10000
+KVSTORE_MYSQL_PASSWORD='replace-me' ./kvstore \
+  --appendonly yes --appendfilename appendonly.aof \
+  --mysql yes --mysql-host 127.0.0.1 --mysql-user kvstore \
+  --mysql-database kvstore
 ```
 
 - `--maxmemory`：缓存条目的逻辑字节上限，接受字节数或大小写不敏感的
@@ -86,6 +99,14 @@ make
 - `--dbfilename`：RDB 路径，默认 `dump.kvrdb`。
 - `--save-seconds N --save-changes M`：两个值必须同时为非零；经过至少 N 秒且累计
   至少 M 次成功写后自动触发一次 `BGSAVE`。自动保存不会调用阻塞式 `SAVE`。
+- `--mysql yes|no`：启用 MySQL Cache-Aside，默认 `no`；启用时强制要求 AOF，密码
+  只从 `KVSTORE_MYSQL_PASSWORD` 读取。
+- `--mysql-host/port/user/database`：默认 `127.0.0.1:3306`、用户和库名均为
+  `kvstore`。服务不执行 DDL，建表步骤见 `config/mysql-v0.7.0.sql`。
+- `--mysql-read-workers` 默认 `8`；连接、读写超时默认 `2` 秒；读队列默认
+  `4096`，有序写队列默认 `64MiB`，单 key 完整回源上限默认 `64MiB`。
+- `--mysql-negative-ttl-ms/--mysql-negative-capacity`：空值缓存默认 `3000` 毫秒、
+  `10000` 个 key，写命令会立即失效对应空值。
 
 `maxmemory` 统计 key/value 分配及缓存条目和 Hash 节点的固定元数据，不等同于
 进程 RSS。Hash 桶数组和 TTL 堆的预留空间通过 `index_memory` 单独报告。
@@ -114,7 +135,7 @@ AOF 只记录实际改变 Cache 的写操作：
   `DEL`。
 - `maxmemory/maxkeys` 触发的 LRU 淘汰记录显式 `DEL`。
 
-未命中的写命令、参数/容量错误、GET/TTL/INFO/PING 等只读命令和 TTL 自然过期
+未实际生效的写命令、参数/容量错误、GET/TTL/INFO/PING 等只读命令和 TTL 自然过期
 不重复写 AOF。
 
 启用 AOF 时一次性分配 256 KiB 可复用编码缓冲区，命令直接追加到缓冲区，避免
@@ -123,6 +144,26 @@ AOF 只记录实际改变 Cache 的写操作：
 一次文件写入。`everysec` 的 `fdatasync` 由专用后台线程执行，不阻塞 Reactor 等待
 同步完成；正常退出会等待最终同步。`always` 为保持逐命令持久性，仍对每条写命令
 执行 write + fdatasync，但复用编码缓冲区。
+
+### MySQL Cache-Aside
+
+启用 MySQL 后，内存命中仍由单线程 Reactor 直接返回；String、Hash、ZSet 顶层 key
+未命中时由读线程池完整加载对象，同 key 并发 miss 合并为一次查询。每个连接至多挂起
+一个请求，完成结果通过 eventfd 回到 Reactor 线程并继续处理该连接剩余 Pipeline，
+MySQL 工作线程不访问 Cache、AOF 或连接对象。
+
+写成功的耐久边界仍是本地 Cache 与 AOF：每条实际生效的 AOF mutation 后紧邻一个
+`PING KVMYSQL1:<uuid>:<seq>` 标记，后台单 writer 按序在同一 MySQL 事务内更新业务表、
+change log 和水位。LRU 淘汰产生的无标记 `DEL` 只维护热快照，不删除最终数据。启动
+时先扫描完整 AOF：MySQL 落后则补投，领先则按 change log 失效旧快照 key；首次启用
+只接受空业务表，并把 RDB+AOF 恢复出的对象和绝对 TTL 灌入数据库。对账成功前不会
+创建监听 socket。
+
+运行期断库时，未过期的内存命中继续服务，miss 返回
+`ERR MySQL backend unavailable`；写队列达到高水位后写命令返回 `TRYAGAIN`。脏 key
+在 writer 水位追平前即使被 LRU 淘汰，后续读也会保持挂起而不会用数据库旧值回填。
+服务最多等待 5 秒排空写队列，未完成 mutation 由 AOF 在下次启动补投。部署、恢复和
+故障语义详见 `docs/v0.7.0-mysql-cache-aside.md`。
 
 ## RESP2 命令
 
@@ -142,6 +183,7 @@ AOF 只记录实际改变 Cache 的写操作：
 | `PERSIST key` | 清除 TTL | Integer `1` 或 `0` |
 | `INFO CACHE` | 查询缓存统计 | Bulk String |
 | `INFO PERSISTENCE` | 查询 AOF、RDB、BGSAVE、fork 与刷盘统计 | Bulk String |
+| `INFO MYSQL` | 查询连接、队列、水位、回源、合并、负缓存及错误统计 | Bulk String |
 | `DBSIZE` | 查询顶层 key 数，供恢复校验使用 | Integer |
 | `PING [message]` | 探活或回显 | Simple/Bulk String |
 | `HSET key field value [field value ...]` | 新增或更新 field | 新增 field 数 |
@@ -194,6 +236,7 @@ hash_fields zset_members zset_engine
 make test
 make integration-test
 make benchmark-test
+KVSTORE_MYSQL_TEST_PASSWORD='replace-me' make mysql-integration-test
 make asan
 make valgrind
 make helgrind
@@ -261,6 +304,33 @@ P99 应和以下指标一起判断：
   错误数、命中率、过期/淘汰增量，避免用降低吞吐换取表面上的低延迟。
 - P99 至少需要足够样本，并应执行多轮报告中位数和波动范围；当前客户端是闭环
   压测，会受到 coordinated omission 影响，不等价于固定到达率负载模型。
+
+### v0.7.0 MySQL 全量冷 miss 实测
+
+本轮在 VMware Ubuntu、客户端/服务/本机 MySQL 同机条件下，使用 32 个连接、
+Pipeline 1、64B String value 和不重复 key。每轮均以新进程和空 AOF 启动，计时前
+Cache key 数为 0；MySQL/InnoDB buffer pool 不清空，因此“冷”只表示 kvstore 内存
+Cache 冷，数据库缓冲为热。测试脚本要求每轮全部 GET 返回预置 value、
+`mysql_loads` 增量等于请求数、无合并/回源错误且读队列排空，否则拒绝汇总。
+
+10,000 请求 smoke 为 29,024.98 QPS、P99 1.804 ms，校验通过。正式结果使用
+100,000 个唯一 key，每轮 100,000 次 GET，5 轮全部校验通过：
+
+| 轮次 | QPS | P99 |
+| ---: | ---: | ---: |
+| 1 | 26,491.81 | 1.965 ms |
+| 2 | 27,525.39 | 1.850 ms |
+| 3 | 26,987.51 | 1.973 ms |
+| 4 | 26,868.13 | 1.901 ms |
+| 5 | 23,343.86 | 2.179 ms |
+| **中位数** | **26,868.13** | **1.965 ms** |
+
+QPS 范围为 23,343.86–27,525.39，五轮总体 CV 为 5.67%；P99 范围为
+1.850–2.179 ms。第 5 轮明显偏低，因此该数据作为完整披露的阶段实测中位数，不能
+宣称为波动低于 5% 的稳定门禁。简历可表述为：“在 32 并发、64B value、全量冷 key
+miss 条件下，MySQL 回源吞吐约 26.9K QPS，P99 延迟约 1.97 ms（5 轮中位数，
+Pipeline=1）。”测试方法和未完成门禁见
+[`docs/v0.7.0-mysql-cache-aside.md`](docs/v0.7.0-mysql-cache-aside.md)。
 
 ### Redis 6.2.23 Hash/ZSet 对照
 
@@ -351,7 +421,7 @@ everysec 和 everysec+BGSAVE。结果文件位于：
 - [`bench/result/aof-latency.csv`](bench/result/aof-latency.csv)
 - [`bench/result/aof-replay.csv.summary.csv`](bench/result/aof-replay.csv.summary.csv)
 
-42 个 Redis 对照汇总组的 QPS CV 全部低于 5%，最高约 2.06%；错误总数为 0，
+42 个 Redis 对照汇总组的 QPS CV 全部低于 5%，最高约 4.70%；错误总数为 0，
 最终 cardinality 均为 100,000，BGSAVE 生成的 RDB 也都恢复到 100,000。
 18 个胜出后端发布对照单元中 15 个通过：String 和 ZSet 的 P16/P64 全部不劣于
 Redis，Hash P64 全部通过，三个失败单元均集中在 Hash P16 QPS。下表中的 P99
@@ -359,40 +429,39 @@ Redis，Hash P64 全部通过，三个失败单元均集中在 Hash P16 QPS。�
 
 | 工作负载 | Pipeline | 策略/场景 | 项目 QPS | Redis QPS | QPS 差异 | 项目 P99 | Redis P99 | P99 优势 | 对照结果 |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| String | 16 | off | 803,838 | 737,308 | +9.02% | 965 μs | 1,308 μs | 26.22% | 通过 |
-| String | 16 | everysec | 745,724 | 697,389 | +6.93% | 847 μs | 1,377 μs | 38.50% | 通过 |
-| String | 16 | everysec+BGSAVE | 750,896 | 693,495 | +8.28% | 852 μs | 1,381 μs | 38.27% | 通过 |
-| String | 64 | off | 1,869,994 | 1,503,829 | +24.35% | 1,681 μs | 2,474 μs | 32.08% | 通过 |
-| String | 64 | everysec | 1,767,973 | 1,405,998 | +25.75% | 1,442 μs | 2,661 μs | 45.82% | 通过 |
-| String | 64 | everysec+BGSAVE | 1,738,315 | 1,392,234 | +24.86% | 1,579 μs | 2,698 μs | 41.49% | 通过 |
-| Hash | 16 | off | 813,652 | 835,321 | -2.59% | 984 μs | 1,054 μs | 6.58% | **QPS 未通过** |
-| Hash | 16 | everysec | 717,059 | 775,495 | -7.54% | 1,110 μs | 1,125 μs | 1.31% | **QPS 未通过** |
-| Hash | 16 | everysec+BGSAVE | 723,447 | 774,666 | -6.61% | 1,106 μs | 1,132 μs | 2.24% | **QPS 未通过** |
-| Hash | 64 | off | 1,301,317 | 1,191,994 | +9.17% | 2,645 μs | 3,722 μs | 28.94% | 通过 |
-| Hash | 64 | everysec | 1,225,108 | 1,166,463 | +5.03% | 2,802 μs | 3,991 μs | 29.80% | 通过 |
-| Hash | 64 | everysec+BGSAVE | 1,207,517 | 1,166,533 | +3.51% | 2,823 μs | 3,966 μs | 28.81% | 通过 |
-| ZSet | 16 | off | 740,988 | 631,443 | +17.35% | 1,002 μs | 1,308 μs | 23.43% | 通过 |
-| ZSet | 16 | everysec | 731,462 | 626,360 | +16.78% | 1,277 μs | 1,299 μs | 1.70% | 通过 |
-| ZSet | 16 | everysec+BGSAVE | 720,855 | 624,108 | +15.50% | 1,291 μs | 1,302 μs | 0.81% | 通过 |
-| ZSet | 64 | off | 1,373,888 | 948,234 | +44.89% | 2,787 μs | 3,667 μs | 23.99% | 通过 |
-| ZSet | 64 | everysec | 1,370,832 | 935,251 | +46.57% | 2,997 μs | 3,721 μs | 19.46% | 通过 |
-| ZSet | 64 | everysec+BGSAVE | 1,370,283 | 938,899 | +45.95% | 2,928 μs | 3,718 μs | 21.25% | 通过 |
+| String | 16 | off | 808,490 | 747,081 | +8.22% | 959 μs | 1,275 μs | 24.75% | 通过 |
+| String | 16 | everysec | 752,673 | 711,209 | +5.83% | 871 μs | 1,325 μs | 34.28% | 通过 |
+| String | 16 | everysec+BGSAVE | 758,729 | 710,063 | +6.85% | 862 μs | 1,343 μs | 35.79% | 通过 |
+| String | 64 | off | 1,888,875 | 1,543,316 | +22.39% | 1,642 μs | 2,403 μs | 31.65% | 通过 |
+| String | 64 | everysec | 1,770,578 | 1,437,695 | +23.15% | 1,500 μs | 2,619 μs | 42.75% | 通过 |
+| String | 64 | everysec+BGSAVE | 1,751,162 | 1,420,981 | +23.24% | 1,666 μs | 2,632 μs | 36.69% | 通过 |
+| Hash | 16 | off | 833,188 | 852,135 | -2.22% | 1,011 μs | 1,031 μs | 1.89% | **QPS 未通过** |
+| Hash | 16 | everysec | 737,511 | 757,458 | -2.63% | 1,099 μs | 1,190 μs | 7.61% | **QPS 未通过** |
+| Hash | 16 | everysec+BGSAVE | 744,091 | 794,301 | -6.32% | 1,064 μs | 1,089 μs | 2.31% | **QPS 未通过** |
+| Hash | 64 | off | 1,471,940 | 1,218,598 | +20.79% | 2,380 μs | 3,275 μs | 27.32% | 通过 |
+| Hash | 64 | everysec | 1,337,242 | 1,194,017 | +12.00% | 2,570 μs | 3,520 μs | 26.99% | 通过 |
+| Hash | 64 | everysec+BGSAVE | 1,383,256 | 1,219,927 | +13.39% | 2,484 μs | 3,559 μs | 30.20% | 通过 |
+| ZSet | 16 | off | 760,678 | 658,041 | +15.60% | 996 μs | 1,236 μs | 19.39% | 通过 |
+| ZSet | 16 | everysec | 734,461 | 643,565 | +14.12% | 1,260 μs | 1,271 μs | 0.90% | 通过 |
+| ZSet | 16 | everysec+BGSAVE | 735,473 | 641,986 | +14.56% | 1,260 μs | 1,267 μs | 0.55% | 通过 |
+| ZSet | 64 | off | 1,575,172 | 989,565 | +59.18% | 2,283 μs | 3,473 μs | 34.27% | 通过 |
+| ZSet | 64 | everysec | 1,532,505 | 967,685 | +58.37% | 2,492 μs | 3,529 μs | 29.37% | 通过 |
+| ZSet | 64 | everysec+BGSAVE | 1,510,698 | 961,113 | +57.18% | 2,547 μs | 3,568 μs | 28.62% | 通过 |
 
-ZSet 的四组 P16/P64、off/everysec 几何平均 QPS 为 SkipList 1,005,159、RBTree
-999,317，SkipList 领先约 0.58%。差异不超过 1%，因此按预定规则继续使用
+ZSet 的四组 P16/P64、off/everysec 几何平均 QPS 为 SkipList 1,077,643、RBTree
+1,074,634，SkipList 领先约 0.28%。差异不超过 1%，因此按预定规则继续使用
 SkipList 作为默认后端。
 
 严格门禁 JSON 的最终状态仍为 `passed: false`。除三个 Hash P16 Redis 对照外，
-项目自身 everysec 相对 off 还有以下六项偏差：
+项目自身 everysec 相对 off 还有以下五项偏差：
 
 | 内部门槛偏差 | 实测 | 原门槛 |
 | --- | ---: | ---: |
-| String P16 everysec QPS 损失 | 7.23% | ≤ 5% |
-| String P64 everysec QPS 损失 | 5.46% | ≤ 5% |
-| Hash P16 everysec QPS 损失 | 11.87% | ≤ 5% |
-| Hash P16 everysec P99 增长 | 12.76% | ≤ 10% |
-| Hash P64 everysec QPS 损失 | 5.86% | ≤ 5% |
-| ZSet P16 everysec P99 增长 | 27.46% | ≤ 10% |
+| String P16 everysec QPS 损失 | 6.90% | ≤ 5% |
+| String P64 everysec QPS 损失 | 6.26% | ≤ 5% |
+| Hash P16 everysec QPS 损失 | 11.48% | ≤ 5% |
+| Hash P64 everysec QPS 损失 | 9.15% | ≤ 5% |
+| ZSet P16 everysec P99 增长 | 26.46% | ≤ 10% |
 
 这些偏差被明确接受为 v0.6.2 的已知限制：版本按功能完整性、正确性、资源检查、
 15/18 Redis 对照通过以及 BGSAVE/恢复结果发布，不把 `passed: false` 改写为通过；
@@ -400,18 +469,18 @@ Hash P16 和 AOF 尾延迟继续作为后续性能债务。
 
 #### BGSAVE 影响
 
-相对普通 everysec，BGSAVE 期间的项目 QPS 变化为 +0.89% 到 -1.68%，P99 大多在
-±2.3% 内；String P64 P99 增长 9.48%，仍低于 10%。fork 暂停为 2.5–9.3 ms，
-后台快照持续 339–665 ms，所有单元无客户端错误、无 major fault 且恢复基数正确。
+相对普通 everysec，BGSAVE 期间的项目 QPS 变化为 +3.44% 到 -1.42%，P99 大多在
+±3.4% 内；String P64 P99 增长 11.10%。fork 暂停为 2.5–9.3 ms，后台快照持续
+338–605 ms，所有单元无客户端错误、无 major fault 且恢复基数正确。
 
 | 类型 | Pipeline | BGSAVE QPS 变化 | P99 变化 | fork 暂停 | 快照持续时间 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| String | 16 | +0.69% | +0.68% | 2.500 ms | 605 ms |
-| String | 64 | -1.68% | +9.48% | 2.979 ms | 665 ms |
-| Hash | 16 | +0.89% | -0.31% | 7.886 ms | 479 ms |
-| Hash | 64 | -1.44% | +0.76% | 9.316 ms | 522 ms |
-| ZSet SkipList | 16 | -1.45% | +1.16% | 5.112 ms | 339 ms |
-| ZSet SkipList | 64 | -0.04% | -2.29% | 4.173 ms | 402 ms |
+| String | 16 | +0.80% | -0.97% | 2.500 ms | 605 ms |
+| String | 64 | -1.10% | +11.10% | 3.209 ms | 565 ms |
+| Hash | 16 | +0.89% | -3.21% | 9.305 ms | 479 ms |
+| Hash | 64 | +3.44% | -3.34% | 8.397 ms | 522 ms |
+| ZSet SkipList | 16 | +0.14% | +0.02% | 4.818 ms | 338 ms |
+| ZSet SkipList | 64 | -1.42% | +2.19% | 4.037 ms | 382 ms |
 
 #### AOF 在线吞吐与延迟
 
@@ -421,13 +490,13 @@ AOF 在线测试同样使用 32 连接、Pipeline 16、100,000 keyspace、64B va
 
 | AOF 策略 | QPS 中位数 | QPS CV | 相对 off | P50 | P99 | P99.9 | 单轮最大延迟中位数 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| off | 804,711 | 0.66% | — | 610 μs | 956 μs | 1,081 μs | 3.16 ms |
-| no | 756,258 | 0.66% | -6.02% | 670 μs | 824 μs | 1,001 μs | 3.15 ms |
-| everysec | 749,211 | 0.48% | -6.90% | 669 μs | 865 μs | 1,409 μs | 18.14 ms |
+| off | 802,657 | 0.49% | — | 612 μs | 965 μs | 1,074 μs | 3.99 ms |
+| no | 762,516 | 0.57% | -5.00% | 660 μs | 816 μs | 1,004 μs | 3.85 ms |
+| everysec | 761,931 | 0.49% | -5.07% | 664 μs | 815 μs | 1,116 μs | 13.85 ms |
 
-everysec 相对 no 只再损失约 0.93% QPS，主要固定成本来自 AOF 编码、writer 往返
-和响应屏障。everysec 的最大延迟中位数约为 off 的 5.7 倍，且五轮最大值均落在
-13.8–23.7 ms，说明周期同步仍会形成极端长尾。P99 低于 off 不代表持久化降低了
+everysec 相对 no 只再损失约 0.08% QPS，主要固定成本来自 AOF 编码、writer 往返
+和响应屏障。everysec 的最大延迟中位数约为 off 的 3.5 倍，且五轮最大值均落在
+13.6–14.5 ms，说明周期同步仍会形成极端长尾。P99 低于 off 不代表持久化降低了
 服务时间，因为当前 Pipeline 延迟包含批次排队和响应顺序；应结合 P50、P99.9、
 max 与 `INFO PERSISTENCE` 的 fdatasync 统计判断。
 
@@ -439,14 +508,14 @@ Hash、ZSet 和 10k/100k/1m 规模上都快于 Redis；以下为 1,000,000 命�
 
 | 类型/后端 | 项目回放 | Redis 回放 | 相对 Redis |
 | --- | ---: | ---: | ---: |
-| String | 0.426 s | 0.744 s | 1.75× |
-| Hash | 0.383 s | 0.884 s | 2.31× |
-| ZSet SkipList | 0.533 s | 1.038 s | 1.94× |
-| ZSet RBTree | 0.577 s | 1.038 s | 1.80× |
+| String | 0.403 s | 0.726 s | 1.80× |
+| Hash | 0.357 s | 0.900 s | 2.52× |
+| ZSet SkipList | 0.527 s | 1.045 s | 1.98× |
+| ZSet RBTree | 0.608 s | 1.045 s | 1.72× |
 
-各规模项目相对 Redis 的回放加速约为 1.75×–2.68×。ZSet 首轮 10k 时 RBTree
+各规模项目相对 Redis 的回放结果均更快。ZSet 首轮 10k 时 RBTree
 更快，但 100k/1m 以及后续轮次总体由 SkipList 占优。部分后四轮 CV 超过 5%，
-最高约 9.84%，因此回放数据用于阶段结论，不作为 v0.6.2 严格门禁。
+因此回放数据用于阶段结论，不作为 v0.6.2 严格门禁。
 
 结果文件本身没有嵌入完整 CPU、内存、磁盘/文件系统、Redis 二进制校验值和提交号；
 复现实验时仍必须补齐这些环境元数据。v0.6.2 的发布决定是在保留这一可复现性缺口
@@ -554,13 +623,16 @@ v0.4 的阶段性能基线及解释记录在发布说明中；以上 v0.5.1 数�
 
 ## 当前限制
 
+- v0.7.0 已完成 MySQL Cache-Aside 功能和全量冷 String miss 实测，但 100% 内存命中、
+  热写回、热点合并/断库性能及当前版本完整 sanitizer/Valgrind/Helgrind 发布矩阵尚未
+  闭环，因此当前 feature 分支不应创建正式 `v0.7.0` tag/Release。
 - v0.6.2 在明确接受严格门禁 `passed: false` 的前提下发布：Hash P16 的三个 Redis
   对照单元 QPS 未达标，且 String/Hash 的部分 everysec QPS 损失与 ZSet P16
   everysec P99 增幅超过原门槛；详见上文验收表和原始结果文件。
-- AOF rewrite、MySQL Cache-Aside、配置文件、集群和复制尚未实现；RDB 不是 Redis
+- AOF rewrite、外部 SQL 写入/CDC、配置文件、集群和复制尚未实现；RDB 不是 Redis
   RDB 格式，检查点前 AOF 历史不会清理。
 - `SAVE` 按 Redis 语义同步阻塞 Reactor，只用于人工维护、诊断和确定性测试，不进入
   QPS 发布结果；生产快照使用 `BGSAVE`。`always` 按定义逐条等待 fdatasync。
 - Hash 只扩容、不缩容；当前仍使用已有的非加盐字节哈希函数。
 - LRU 是精确实现，不是 Redis 的抽样近似算法；TTL 不支持成员级过期。
-- io_uring、高维向量检索、负载均衡、分片、复制和集群不属于 v0.6.2。
+- io_uring、高维向量检索、负载均衡、分片、复制和集群不属于 v0.7.0。
